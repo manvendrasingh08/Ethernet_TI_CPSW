@@ -1,0 +1,110 @@
+Carrier in Ethernet Networks
+
+Ethernet devices use a carrier signal to indicate when the medium (usually a twisted pair of wires or fiber) is physically connected and ready for communication.
+
+Carrier ON: The network device has detected a valid physical connection (link) to the network. The link can be up, meaning the network interface card (NIC) is operational and can send or receive frames.
+
+Carrier OFF: The network device has detected that the physical connection is either absent or not functioning properly. This could happen if the cable is unplugged, there is a failure in the physical connection (e.g., the switch port is down), or if the link has not been established yet.
+
+cpsw_ndo_open function: 
+
+Called when the interface is made up using ***ifconfig eth0 up***. It calls dev_open and ot calls ndo_open)_
+
+1. Power Management Handling
+   ret = pm_runtime_get_sync(cpsw->dev);
+   if (ret < 0) {
+       pm_runtime_put_noidle(cpsw->dev);
+       return ret;
+   }
+   
+   Explanation: Ensures the device is powered and ready for operation. If it fails, it releases resources and exits early.
+
+2. Carrier Off
+   netif_carrier_off(ndev);
+   
+   Explanation: Sets the carrier status to off initially to prevent the kernel from assuming the device is up before hardware is fully initialized.
+
+3. Set Number of TX Queues
+   ret = netif_set_real_num_tx_queues(ndev, cpsw->tx_ch_num);
+   
+   Explanation: Configures the actual number of transmit (TX) queues based on the hardware setup (tx_ch_num).
+
+4. Set Number of RX Queues
+   ret = netif_set_real_num_rx_queues(ndev, cpsw->rx_ch_num);
+   
+   Explanation: Configures the actual number of receive (RX) queues based on the hardware setup (rx_ch_num).
+
+5. CPSW Initialization
+   if (!cpsw->usage_count)
+       cpsw_init_host_port(priv);
+   for_each_slave(priv, cpsw_slave_open, priv);
+   
+   Explanation: Initializes the host and slave ports of the CPSW. This is done only if the usage_count is 0, indicating it's the first interface.
+
+6. VLAN Setup
+   if (!cpsw->data.dual_emac)
+       cpsw_add_default_vlan(priv);
+   else
+       cpsw_ale_add_vlan(cpsw->ale, cpsw->data.default_vlan, ALE_ALL_PORTS, ALE_ALL_PORTS, 0, 0);
+   
+   Explanation: Adds a default VLAN if not in dual EMAC mode. In dual EMAC mode, it configures the VLAN in the ALE (Address Lookup Engine).
+
+7. Flow Control, Stats, and NAPI Initialization
+   writel_relaxed(0, &cpsw->regs->ptype);
+   writel_relaxed(0x7, &cpsw->regs->stat_port_en);
+   writel(0x7, &cpsw->regs->flow_control);
+   napi_enable(&cpsw->napi_rx);
+   napi_enable(&cpsw->napi_tx);
+   
+   Explanation: Initializes flow control, statistics collection, and enables NAPI (for efficient packet processing) for both RX and TX.
+
+8. Enable TX and RX IRQs
+   if (cpsw->tx_irq_disabled) {
+       cpsw->tx_irq_disabled = false;
+       enable_irq(cpsw->irqs_table[1]);
+   }
+
+   if (cpsw->rx_irq_disabled) {
+       cpsw->rx_irq_disabled = false;
+       enable_irq(cpsw->irqs_table[0]);
+   }
+
+   Explanation: Re-enables TX and RX interrupts if they were previously disabled, allowing the CPSW to handle incoming and outgoing packets.
+
+9. XDP and RX Channel Setup
+   ret = cpsw_create_xdp_rxqs(cpsw);
+   ret = cpsw_fill_rx_channels(priv);
+   
+   Explanation: Initializes XDP (eXpress Data Path) for high-performance packet processing and sets up the RX channels.
+
+10. CPTS Initialization
+    if (cpsw->cpts) {
+        if (cpts_register(cpsw->cpts))
+            dev_err(priv->dev, "error registering cpts device\n");
+        else
+            writel(0x10, &cpsw->wr_regs->misc_en);
+    }
+    
+    Explanation: Initializes the CPTS (timestamping) feature for accurate packet timestamping. If it fails to register, an error is logged.
+
+11. Coalesce Settings (Interrupt Pacing)
+    if (cpsw->coal_intvl != 0) {
+        struct ethtool_coalesce coal;
+        coal.rx_coalesce_usecs = cpsw->coal_intvl;
+        cpsw_set_coalesce(ndev, &coal);
+    }
+    
+    Explanation: Configures interrupt coalescing (pacing) to optimize interrupt handling and reduce CPU overhead, based on coal_intvl.
+
+12. Start DMA and Enable Interrupts
+    cpdma_ctlr_start(cpsw->dma);
+    cpsw_intr_enable(cpsw);
+    
+    Explanation: Starts the DMA controller and enables interrupts for the CPSW device to handle network traffic.
+
+13. Usage Count Update and Finalization
+    cpsw->usage_count++;
+    return 0;
+    
+    Explanation: Increments the usage_count, indicating that the interface is now using CPSW, and returns 0 to signal success.
+
