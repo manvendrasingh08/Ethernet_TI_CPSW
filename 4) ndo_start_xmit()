@@ -1,0 +1,186 @@
+
+
+The function cpsw_ndo_start_xmit is called to perform the low-level transmission operations (such as padding, timestamping, and submitting to DMA) when the packet is ready to be transmitted via the CPSW (Crossbar Switch) network interface.
+
+After the dev_queue xmit() fucntion the ndo_xmit_function is called.
+
+IN SHORT WHAT HAPPENS : 
+
+		Padding: The packet is padded to meet the minimum size requirement if necessary (skb_padto()).
+
+		Timestamping: If hardware timestamping is enabled and supported, the timestamp flag is set.
+
+		Queue Selection: The appropriate transmit queue is chosen based on the packet’s metadata (skb_get_queue_mapping()).
+						using the cpu affinity.
+
+		Channel Selection: The appropriate DMA channel is selected based on the queue index.
+
+		Packet Submission: The packet is then submitted to the DMA for actual transmission using cpdma_chan_submit(). This step interacts with
+		 the hardware to send the packet over the network.
+		 
+
+
+READ BELOW TOO ITS IMPORTANT👇️ 
+
+Flow of the Code (High-level Steps)
+=======================================
+
+1)Padding the Packet:
+-------------------------
+
+	The packet (skb) is padded to meet the minimum size requirements. If padding fails, the packet is dropped.
+	minimum size of theethernet frame is 64B and if the frame is smaller than it then it is padded.
+	
+	It is done using the fucntion:  *** skb_padto(skb, tx_packet_min) ***
+
+	Padding is necessary : 
+	----------------------
+			
+		-Hardware (NIC) are sesigned to handle packets of a certain size and is often done for performance reasons, as handling small packets
+		 requires more overhead relative to their data size.
+		
+		-Smaller packets are more prone to errors, and having a minimum size helps ensure that error detection mechanism (like CRC checks)
+						
+>>The function skb_padto(skb, tx_packet_min) ensures that the size of the packet meets the minimum transmission size (tx_packet_min). If the packet is smaller than this threshold, padding is added.		
+
+2) Length Determination:
+---------------------------
+
+	The length of the packet (len) is adjusted to ensure it is at least the minimum size(tx_packet_min).
+	
+		*** len = skb->len < tx_packet_min ? tx_packet_min : skb->len; ***
+
+
+3) Timestamp Handling:
+-----------------------
+	Timestamping is a local mechanism used for performance measurement, debugging, and synchronization on a single device. It is not used for
+	inter-device communication and doesn't travel with the packet across the network.
+	
+	+-----------------------+   <- Packet Data (Ethernet Header, IP Header, Transport Headers, Payload)
+	| Ethernet Header       |	<- This is the part that is sent over the network. 
+	| IP Header             |   
+	| TCP/UDP Header        |
+	| Payload               |
+	+-----------------------+   <- This is the part that is device-specific and not sent over network.
+	| Metadata:             |   <- Metadata area (auxiliary data, flags, etc.)
+	| - tstamp (timestamp)  |   <- The timestamp (for TX or RX) is stored here
+	| - tx_flags            |   <- Various flags like SKBTX_HW_TSTAMP, SKBTX_IN_PROGRESS
+	| - skb references      |   <- Pointers to buffers, etc.
+	+-----------------------+	
+
+
+	If hardware timestamping is enabled and possible, the packet is marked to indicate that timestamping is in progress by NIC.
+	
+	
+	TX Timestamping (Transmit):
+	----------------------------
+
+		>When the packet is ready to be transmitted, and hardware timestamping is enabled, the driver checks if the packet should be
+		 timestamped (using the flag SKBTX_HW_TSTAMP).
+
+		>If timestamping is enabled, the NIC will add the timestamp at the point of transmission, and this timestamp will be stored in the 
+		skb->tstamp field.
+		
+	Same is for the Rx only it is 
+
+4) Queue Mapping:🛑️
+------------------
+
+	```	q_idx = skb_get_queue_mapping(skb);
+		
+		if (q_idx >= cpsw->tx_ch_num)
+		q_idx = q_idx % cpsw->tx_ch_num; ```
+
+
+	The appropriate transmit queue is selected based on the packet's metadata. If necessary, the queue index wraps around to ensure it's within
+	 range.
+	 
+	 Generally there are 8 Tx queues and 8 Rx queues. SO hows the mapping done It is done using the function mentioned below.
+	 
+	 >What happens here?: The queue index (q_idx) is obtained from the packet's metadata using ***skb_get_queue_mapping(skb). *** This tells
+	  the driver which transmit queue to use.
+	  
+	 ****🛑️🛑️ So the queue assigned is generally assigned accordig the cpu affinity in which the program is handled. If it us cpu0 then the Tx 	
+	 		queue at index 0 will be assigned to it by the function skb_get_queue_mapping *****
+
+	 >Handling overflow: If the queue index exceeds the total number of available transmit channels (cpsw->tx_ch_num), the queue index is
+	  wrapped around using the modulus operator (%).
+	  
+	  Channels and the queue are mainly a same thing means the hardwarelooks at the channel and the software looks at the queue.
+	  
+	  !!! 🛑️dma channel holds all the descriptors in a form of linked list and also the info of  all the free and active desriptors in the
+	   channel. And queue has a pointer to this channel. 
+
+5) DMA Channel Selection:
+----------------------------
+
+	The correct DMA channel for the selected queue is fetched.
+	
+		txch = cpsw->txv[q_idx].ch;
+		txq = netdev_get_tx_queue(ndev, q_idx);
+
+
+6) Submitting the Packet to the DMA Channel:
+------------------------------------------------
+
+	The packet is submitted to the DMA engine for transmission through the selected channel using the fucntion : 
+	
+	``` ret = cpdma_chan_submit(txch, skb, skb->data, skb->len, priv->emac_port + cpsw->data.dual_emac); ```
+	
+		What happens here?: The packet is submitted to the selected DMA channel (txch) for transmission. The function provides:
+
+		skb: The packet buffer.
+		skb->data: The actual data to be transmitted.
+		skb->len: The length of the data to be transmitted.
+		priv->emac_port + cpsw->data.dual_emac: The port identifier for the EMAC (Ethernet MAC) in dual-emac mode.
+
+
+7) Handling Transmission Errors:
+-----------------------------------
+	If the DMA submission fails, the packet is dropped, and the transmit queue is stopped.
+	
+	/* If there is no more tx desc left free then we need to
+	 * tell the kernel to stop sending us tx frames.
+	 */
+	 
+		``` if (unlikely(ret != 0)) {
+				cpsw_err(priv, tx_err, "desc submit failed\n");
+				goto fail;
+			}  		
+			
+			unlikely macro coz its very rare to have no free descriptors, There are 1024 to 4096 descriptors per queue.		```
+
+	
+
+
+8) Checking for Free TX Descriptors :
+---------------------------------------
+
+	The system checks if there are free descriptors available in the DMA channel. If there are no free descriptors, the kernel is instructed to
+	 stop sending packets on the queue.
+	 
+   ```if (unlikely(!cpdma_check_free_tx_desc(txch))) {
+    	netif_tx_stop_queue(txq);
+
+    	/* Barrier, so that stop_queue visible to other cpus */
+    	
+    	smp_mb__after_atomic();
+
+			if (cpdma_check_free_tx_desc(txch))   //checking if there is freee desc , then lift the barrier
+				netif_tx_wake_queue(txq);
+}											````
+
+	>What happens here?: This checks if there are free transmission descriptors available in the DMA channel. If there are no free
+	 descriptors, the transmit queue is stopped using netif_tx_stop_queue(txq).
+
+	>Why the barrier?: smp_mb__after_atomic() ensures that the stop operation is visible to other CPUs before proceeding.
+
+	>Resuming transmission: If descriptors become available again, netif_tx_wake_queue(txq) is called to resume transmission.
+
+
+9) Return Status:
+-------------------
+
+	The function returns either NETDEV_TX_OK (success) or NETDEV_TX_BUSY (failure), depending on whether the packet was transmitted successfully or not to teh hardware.
+	
+	
