@@ -1,0 +1,176 @@
+The kernel's network stack will call the ndo_stop method when the network interface is stopped. This can occur in several scenarios:
+
+	1) Interface Down (ifconfig down or ip link set <interface> down):
+
+		>When the user runs the command ifconfig <interface> down or ip link set <interface> down, the interface is administratively brought
+		 down, and the kernel calls the ndo_stop method for the device.
+
+		>In this case, the interface is disabled, and the cpsw_ndo_stop function is called to cleanly shut down the interface and release its
+		 resources.
+
+	2) Shutdown of the Network Interface During Power Management:
+
+		>If the system is going into a low-power state or shutting down, the kernel might stop all network interfaces before suspending or
+		 shutting down the system.
+
+		>In this case, the ndo_stop method would be called to stop the CPSW device and perform cleanup before the device is powered down.
+		
+		
+Summary of What the Function Does:
+
+The cpsw_ndo_stop function is invoked when the CPSW device (the Ethernet interface) is being stopped, typically as part of shutting down or bringing the network interface down.
+
+The function performs several tasks:
+
+	It disables network features like NAPI, interrupts, and DMA if necessary.
+
+	It stops transmission queues and disables carrier detection.
+
+	It ensures that the device's resources are cleaned up and the device is properly powered down.
+
+	It iterates over slave interfaces (Ethernet ports) and stops them as well.
+
+	It also decrements the usage count and performs any necessary cleanup steps related to device power management.
+	
+	
+	
+	
+In Detail Function Breakdown:
+
+1. Retrieve Driver Private Data:
+-----------------------------------
+```
+	   struct cpsw_priv *priv = netdev_priv(ndev);
+	   struct cpsw_common *cpsw = priv->cpsw;
+	
+````
+	   The priv variable holds the private data for the network device (ndev),
+	   which includes the CPSW-specific data structure (cpsw_common).
+	   
+	   priv->cpsw points to the common CPSW data structure, which is shared by 
+	   different components of the CPSW driver.
+
+2. Log the Shutdown:
+----------------------
+```
+   cpsw_info(priv, ifdown, "shutting down cpsw device\n");
+```
+
+   The function logs a message that indicates the CPSW device is being shut down
+   using cpsw_info. This is typically for debugging or informational purposes.
+
+3. Remove Multicast Address Synchronization:
+--------------------------------------------
+```
+   __hw_addr_ref_unsync_dev(&ndev->mc, ndev, cpsw_purge_all_mc);
+```
+
+   This function call unsynchronizes the multicast address list (ndev->mc) from
+   the device, ensuring that the device will not be referencing stale multicast
+   addresses when it is stopped.
+   
+   The cpsw_purge_all_mc function will be called to remove any multicast address
+   references associated with the device.
+
+4. Stop All Transmit Queues:
+-------------------------------
+```
+   netif_tx_stop_all_queues(priv->ndev);
+```
+
+   This stops all transmit queues of the network device. It ensures that no packets
+   are being transmitted while the device is being stopped.
+
+5. Turn Off Carrier Detection:
+--------------------------------
+```
+   netif_carrier_off(priv->ndev);
+```
+
+   This function indicates that the network device has lost carrier (i.e., the
+   physical link is down). It marks the device as "disconnected" from the network.
+
+6. Conditionally Disable Features Based on Usage Count:
+---------------------------------------------------------
+```
+   if (cpsw->usage_count <= 1) {
+       napi_disable(&cpsw->napi_rx);
+       napi_disable(&cpsw->napi_tx);
+       cpts_unregister(cpsw->cpts);
+       cpsw_intr_disable(cpsw);
+       cpdma_ctlr_stop(cpsw->dma);
+       cpsw_ale_stop(cpsw->ale);
+       cpsw_destroy_xdp_rxqs(cpsw);
+   }
+```
+
+   cpsw->usage_count <= 1 checks if there is only one user of the CPSW device
+   (meaning no other references are using it). If true, the following steps occur:
+   
+   - napi_disable(&cpsw->napi_rx): Disables the NAPI (New API) for RX (receive)
+     processing. NAPI is used for efficient interrupt handling and polling in Linux
+     networking.
+   
+   - napi_disable(&cpsw->napi_tx): Disables NAPI for TX (transmit) processing.
+
+   - cpts_unregister(cpsw->cpts): Unregisters the CPTS (Cascaded Timestamping)
+     unit. This unit is responsible for handling hardware timestamps for transmitted
+     and received packets.
+   
+   - cpsw_intr_disable(cpsw): Disables interrupts in the CPSW module.
+
+   - cpdma_ctlr_stop(cpsw->dma): Stops the CPDMA (Cascaded Peripheral DMA) controller,
+     which handles DMA-based packet transmission and reception.
+   
+   - cpsw_ale_stop(cpsw->ale): Stops the ALE (Address Lookup Engine), which is
+     responsible for managing MAC address lookups in the switch.
+   
+   - cpsw_destroy_xdp_rxqs(cpsw): Destroys any XDP (eXpress Data Path) receive queues.
+     XDP is a high-performance mechanism for packet processing in the Linux kernel.
+
+7. Stop Each Slave (Ethernet Port):
+-------------------------------------
+```
+   for_each_slave(priv, cpsw_slave_stop, cpsw);
+```
+
+   Iterates through each slave (physical Ethernet port) managed by the CPSW and
+   calls cpsw_slave_stop on each one. This effectively stops each individual slave port.
+
+8. Check and Handle Resplitting:
+-----------------------------------
+``
+   if (cpsw_need_resplit(cpsw))
+       cpsw_split_res(cpsw);
+```
+
+   This checks if the CPSW device needs to resplit the traffic across multiple
+   queues or devices. If true, cpsw_split_res is called to handle the resplitting.
+
+9. Decrement Usage Count:
+--------------------------
+```
+   cpsw->usage_count--;
+```
+
+   The usage_count is decremented, which keeps track of how many times the CPSW
+   device is being used. This count is important for managing the lifecycle of the
+   device and freeing resources when no longer needed.
+
+10. Release Power Management Resources:
+----------------------------------------
+```
+    pm_runtime_put_sync(cpsw->dev);
+```
+    This call reduces the reference count for the device's runtime power management.
+    If the reference count reaches zero, the device will be powered down. The
+    pm_runtime_put_sync ensures that power management operations are synchronized.
+
+11. Return:
+-------------
+
+    return 0;
+
+
+	
+	
