@@ -1,0 +1,412 @@
+
+The headroom can store data for the processing stages, such as queuing information, timestamps, or pointers to other buffers.
+
++--------------------+----------------------------+-------------------------+
+|  Headroom (64 bytes)|  Packet Data (e.g., Ethernet)|   Tailroom (optional)|
+|  Reserved for flags |  Actual Ethernet Frame       | Padding, checksums   |
+|  or extra info      |  or application data         |                      |
++--------------------+----------------------------+-------------------------+
+
+
+
+The incoming packets are stored in the pages from the page pool and once the pages are peocessed tehnthey are gone back to teh page pool and reused.
+
++--------------------+--------------------+--------------------+-------------------+
+|      Page 1        |      Page 2        |      Page 3        |       Page 4      |
+| (Used for Packet 1)| (Used for Packet 2)| (Used for Packet 3)| (Free / Reusable) |
++--------------------+--------------------+--------------------+-------------------+
+        ↑                    ↑                    ↑                    ↑
+      Pool is               Pool is             Pool is             Pool is
+     Allocating            Allocating          Allocating          Reusing pages
+      Pages for            Pages for           Pages for
+    Packets Reception    Packets Reception   Packets Reception
+    
+    
+ 
+ 
+ ****SEE THE CODE for beter underatnding. Rest theory is here:*****
+
+================================================================================
+WHO CALLS cpsw_rx_handler() AND WHEN?
+================================================================================
+
+1. cpsw_rx_handler() is registered as the RX completion callback when the CPSW
+   (TI Ethernet Switch) driver creates RX DMA channels during the probe() stage.
+
+2. During probe(), the CPSW driver calls:
+       cpdma_chan_create()
+   and passes cpsw_rx_handler() as the RX callback function.
+
+3. When a packet is received by hardware:
+   - DMA writes the packet into one of the page buffers provided by the driver.
+   - DMA completes the descriptor.
+   - The CPDMA engine generates an interrupt.
+   - The interrupt handler wakes NAPI polling or directly calls the RX callback.
+   - The CPDMA driver calls:
+         cpsw_rx_handler(token, len, status)
+
+4. The parameters passed:
+   - token = page pointer the driver supplied earlier during descriptor setup
+   - len   = actual received packet length
+   - status= CPDMA status bits (success, errors, VLAN info, port source, etc.)
+
+This function is called ON EVERY RECEIVED PACKET, in interrupt/NAPI context.
+
+
+================================================================================
+OVERVIEW OF WHAT THE FUNCTION DOES (FULL, NO INFO OMITTED)
+================================================================================
+
+1. Extract the page buffer and access its memory.
+2. Read CPSW metadata stored inside that page (ndev + channel).
+3. Identify the correct network device (in dual-EMAC mode).
+4. Validate status; if the interface is down, recycle or requeue the buffer.
+5. Allocate a new RX page so the current one can be used for SKB/XDP.
+6. If XDP program is attached:
+      - Prepare xdp_buff structure
+      - Handle VLAN encapsulation offsets
+      - Execute XDP program
+      - If XDP returns DROP/REDIRECT/ABORT → requeue this page to DMA
+7. If XDP passes the packet:
+      - Convert the page to an SKB (build_skb)
+      - Reserve headroom
+      - Copy packet length
+      - Handle VLAN tag extraction if needed
+      - Add hardware RX timestamp (if enabled)
+      - Run eth_type_trans() to determine L3 protocol
+8. Release the page back to the pool for normal stack SKB operation.
+9. Deliver the SKB to Linux networking stack with netif_receive_skb().
+10. Update stats: rx_bytes and rx_packets.
+11. REQUEUE BLOCK:
+      - Write metadata (ndev + channel) into new page
+      - Get DMA-mapped address for the page
+      - Submit page as a fresh RX descriptor to DMA engine
+      - If submission fails, recycle page back to pool.
+
+
+================================================================================
+DETAILED EXPLANATION OF ENTIRE FUNCTION (TOP → BOTTOM)
+================================================================================
+
+--------------------------------------------------------------------------------
+1. PARAMETER SETUP AND PAGE EXTRACTION
+--------------------------------------------------------------------------------
+
+page = token;
+pa = page_address(page);
+
+- token is what DMA callback received from descriptor.
+- It is the buffer page previously supplied by the driver.
+- page_address() converts physical kernel page to usable virtual address.
+
+--------------------------------------------------------------------------------
+2. ACCESS METADATA STORED INSIDE PAGE
+--------------------------------------------------------------------------------
+
+xmeta = pa + CPSW_XMETA_OFFSET;
+
+- CPSW stores two pieces of metadata inside each RX page:
+    xmeta->ndev = pointer to network device
+    xmeta->ch   = RX channel number
+- This allows driver to determine which interface and channel owns this page.
+
+cpsw = ndev_to_cpsw(xmeta->ndev);
+
+- Convert struct net_device → cpsw_common (driver global state).
+
+--------------------------------------------------------------------------------
+3. SELECT CORRECT SLAVE INTERFACE (DUAL EMAC MODE)
+--------------------------------------------------------------------------------
+
+if (cpsw->data.dual_emac && status >= 0) {
+    port = CPDMA_RX_SOURCE_PORT(status);
+    if (port)
+        ndev = cpsw->slaves[--port].ndev;
+}
+
+- CPSW can operate as a switch with 2 external Ethernet ports.
+- The status field encodes "which port" the packet came from.
+- The correct net_device must be used for statistics and SKB delivery.
+
+--------------------------------------------------------------------------------
+4. VALIDATE STATUS AND INTERFACE STATE
+--------------------------------------------------------------------------------
+
+if (unlikely(status < 0) || unlikely(!netif_running(ndev))) {
+
+- If device is down OR DMA RX error occurred:
+      → either requeue or recycle
+
+Dual EMAC case:
+- If another interface is up and packet belongs to down interface,
+  requeue the page to DMA to avoid losing RX descriptors.
+
+If interface truly going down:
+- recycle the page (page_pool_recycle_direct)
+- return (end processing)
+
+--------------------------------------------------------------------------------
+5. ALLOCATE A NEW PAGE FOR NEXT DMA RX OPERATION
+--------------------------------------------------------------------------------
+
+new_page = page_pool_dev_alloc_pages(pool);
+
+- Allocate next DMA buffer from page pool.
+- If failed:
+      - drop packet
+      - reassign original page to DMA
+      - increment rx_dropped
+
+--------------------------------------------------------------------------------
+6. XDP PROCESSING (if enabled)
+--------------------------------------------------------------------------------
+
+if (priv->xdp_prog) {
+
+--- VLAN Handling ---
+if (status & CPDMA_RX_VLAN_ENCAP)
+    xdp.data = pa + HEADROOM + VLAN_HDR_SIZE
+else
+    xdp.data = pa + HEADROOM;
+
+xdp.data_end = xdp.data + len;
+
+- Prepares the XDP buffer's valid packet bounds.
+
+xdp_set_data_meta_invalid(&xdp);
+
+- Ensures metadata area is reset.
+
+xdp.data_hard_start = pa;
+xdp.rxq = &priv->xdp_rxq[ch];
+xdp.frame_sz = PAGE_SIZE;
+
+- Full XDP buffer initialization.
+
+port = priv->emac_port + cpsw->data.dual_emac;
+ret = cpsw_run_xdp(...);
+
+- Executes the XDP BPF program.
+- Possible returns:
+      XDP_PASS → continue with normal stack
+      XDP_DROP / REDIRECT / TX → goto requeue
+
+headroom = xdp.data - xdp.data_hard_start;
+
+- XDP may modify packet headroom.
+
+status &= ~CPDMA_RX_VLAN_ENCAP;
+
+- XDP may change VLAN tag, so driver can't rely on CPSW’s VLAN header.
+
+--------------------------------------------------------------------------------
+7. CONVERT PAGE TO SKB (normal network stack path)
+--------------------------------------------------------------------------------
+
+skb = build_skb(pa, total_len);
+
+- Wraps the DMA page into a kernel SKB.
+
+skb_reserve(skb, headroom);
+
+- Reserving space before actual packet data for stack headers.
+
+skb_put(skb, len);
+
+- Extends SKB tail to include packet data.
+
+skb->dev = ndev;
+
+- Assign the correct network interface.
+
+if (status & CPDMA_RX_VLAN_ENCAP)
+    cpsw_rx_vlan_encap(skb);
+
+- Extracts VLAN tag and converts CPSW format to SKB format.
+
+if (priv->rx_ts_enabled)
+    cpts_rx_timestamp(...);
+
+- Add hardware timestamp if enabled.
+
+skb->protocol = eth_type_trans(skb, ndev);
+
+- Determines L3 protocol (IPv4, IPv6, ARP, etc.)
+- Strips Ethernet header and sets skb->protocol.
+
+--------------------------------------------------------------------------------
+8. RELEASE PAGE AND PASS SKB TO LINUX STACK
+--------------------------------------------------------------------------------
+
+page_pool_release_page(pool, page);
+
+🛑️netif_receive_skb(skb); - Deliver packet into Linux networking stack (IP, TCP/UDP, firewall, etc.)
+
+ndev->stats.rx_bytes += len;
+ndev->stats.rx_packets++;
+
+- Update statistics.
+
+--------------------------------------------------------------------------------
+9. REQUEUE BLOCK (SUBMIT PAGE BACK TO DMA ENGINE)
+--------------------------------------------------------------------------------
+
+xmeta = page_address(new_page) + CPSW_XMETA_OFFSET;
+xmeta->ndev = ndev;
+xmeta->ch = ch;
+
+- Setup metadata for next DMA RX operation.
+
+dma = page_pool_get_dma_addr(new_page) + CPSW_HEADROOM;
+
+- Get DMA physical address (already mapped)
+- Add headroom so DMA writes data after metadata.
+
+ret = cpdma_chan_submit_mapped(cpsw->rxv[ch].ch,
+                               new_page, dma, pkt_size, 0);
+
+- Submit buffer as an RX descriptor to hardware DMA engine.
+- DMA will fill this page with next packet.
+
+If failed:
+    WARN_ON(ret == -ENOMEM);
+    page_pool_recycle_direct(pool, new_page);
+
+- Full DMA ring or unexpected error.
+- Recycle page safely.
+
+
+================================================================================
+ENTIRE FUNCTION AND EXPLANATION
+================================================================================
+
+//called in the interrupt context when the packet has received.
+static void cpsw_rx_handler(void *token, int len, int status)  //parametrs are passsed on by the ethernet ports
+{
+	struct page		*new_page, *page = token; //page is the where the recived packet is stored.
+	void			*pa = page_address(page); //page_address is mapping the physical addr of page to the vitual addr 
+	struct cpsw_meta_xdp	*xmeta = pa + CPSW_XMETA_OFFSET; // moving the pointer to point the metadata so can directly access it.
+	struct cpsw_common	*cpsw = ndev_to_cpsw(xmeta->ndev); //converting the ndev struct to cpsw struct.
+	int			pkt_size = cpsw->rx_packet_max;
+	int			ret = 0, port, ch = xmeta->ch;
+	int			headroom = CPSW_HEADROOM; //The headroom can store data for the processing stages, such as queuing information, timestamps, or pointers to other buffers.
+	struct net_device	*ndev = xmeta->ndev;
+	struct cpsw_priv	*priv;
+	struct page_pool	*pool;
+	struct sk_buff		*skb;
+	struct xdp_buff		xdp;
+	dma_addr_t		dma;
+
+
+	if (cpsw->data.dual_emac && status >= 0) { 
+		port = CPDMA_RX_SOURCE_PORT(status);
+		if (port)
+			ndev = cpsw->slaves[--port].ndev;
+	}
+/*
+If cpsw->data.dual_emac is true, here are multiple Ethernet interfaces (slaves) handled by the same CPSW driver.
+
+ status >= 0: This checks if the reception status is valid. The status indicates whether the packet was received successfully.
+
+CPDMA_RX_SOURCE_PORT(status): This macro extracts the source port information from the status (i.e., which slave port the packet was received on)
+
+*/
+
+
+	priv = netdev_priv(ndev);
+	pool = cpsw->page_pool[ch]; // page pool associated with the specific DMA channel ->ch
+	if (unlikely(status < 0) || unlikely(!netif_running(ndev))) {
+		/* In dual emac mode check for all interfaces */
+		if (cpsw->data.dual_emac && cpsw->usage_count &&
+		    (status >= 0)) {
+			/* The packet received is for the interface which
+			 * is already down and the other interface is up
+			 * and running, instead of freeing which results
+			 * in reducing of the number of rx descriptor in
+			 * DMA engine, requeue page back to cpdma.
+			 */
+			new_page = page;
+			goto requeue;
+		}
+
+		/* the interface is going down, pages are purged */
+		page_pool_recycle_direct(pool, page);
+		return;
+	}
+
+	new_page = page_pool_dev_alloc_pages(pool); // This allocates a new page from the page pool for receiving the next packet.
+	if (unlikely(!new_page)) {
+		new_page = page;
+		ndev->stats.rx_dropped++;
+		goto requeue;
+	}
+
+	if (priv->xdp_prog) {  //check id XDP is enabled.
+		if (status & CPDMA_RX_VLAN_ENCAP) { //checks if the received packet has VLAN encapsulation
+			xdp.data = pa + CPSW_HEADROOM + CPSW_RX_VLAN_ENCAP_HDR_SIZE; //If VLAN encapsulation is present, xdp.data is adjusted to account for the VLAN header, which is placed after the Ethernet header.
+			xdp.data_end = xdp.data + len -
+				       CPSW_RX_VLAN_ENCAP_HDR_SIZE;
+		} else {      // If there is no VLAN encapsulation, xdp.data is simply set to the packet data after the headroom (CPSW_HEADROOM), and xdp.data_end is set to the end of the packet (len).
+			xdp.data = pa + CPSW_HEADROOM;
+			xdp.data_end = xdp.data + len;
+		}
+
+		xdp_set_data_meta_invalid(&xdp);  //invalidates the metadata, so that once invoked it dopeas not use stale metatda
+
+		xdp.data_hard_start = pa;
+		xdp.rxq = &priv->xdp_rxq[ch];
+		xdp.frame_sz = PAGE_SIZE;
+
+		port = priv->emac_port + cpsw->data.dual_emac; // tells the port number.
+		ret = cpsw_run_xdp(priv, ch, &xdp, page, port, &len); // it process the xdp packet and returns CPSW_XDP_PASS on success.
+		if (ret != CPSW_XDP_PASS)  
+			goto requeue;   // if failed goto requeue.
+
+		headroom = xdp.data - xdp.data_hard_start;
+
+		/* XDP prog can modify vlan tag, so can't use encap header */
+		status &= ~CPDMA_RX_VLAN_ENCAP;
+	}
+
+	/* pass skb to netstack if no XDP prog or returned XDP_PASS */
+	skb = build_skb(pa, cpsw_rxbuf_total_len(pkt_size));
+	if (!skb) {
+		ndev->stats.rx_dropped++;
+		page_pool_recycle_direct(pool, page);
+		goto requeue;
+	}
+
+	skb_reserve(skb, headroom);   // reserve the headroom size for the metadata like timestamp, different flags, TCP segmentatin etc..
+	skb_put(skb, len);  // putting teh packet data in the skb.
+	skb->dev = ndev;
+	if (status & CPDMA_RX_VLAN_ENCAP)
+		cpsw_rx_vlan_encap(skb);
+	if (priv->rx_ts_enabled)    //checking if the timestamp is enabled.
+		cpts_rx_timestamp(cpsw->cpts, skb);
+	skb->protocol = eth_type_trans(skb, ndev);  // checking the eth_type in the ethernet header for layer3 protocol IPv4, Ipv6 or ARP.
+
+	/* unmap page as no netstack skb page recycling */
+	page_pool_release_page(pool, page);
+	netif_receive_skb(skb);   // *** This sends the skb into the network stack ***
+
+	ndev->stats.rx_bytes += len;
+	ndev->stats.rx_packets++;  //increasing the number of rx_packets can be seen using ethtool -S eth0
+
+requeue:
+	xmeta = page_address(new_page) + CPSW_XMETA_OFFSET;
+	xmeta->ndev = ndev;
+	xmeta->ch = ch;
+
+	dma = page_pool_get_dma_addr(new_page) + CPSW_HEADROOM;
+	ret = cpdma_chan_submit_mapped(cpsw->rxv[ch].ch, new_page, dma,pkt_size, 0); //It submits the page as a new RX descriptor into the RX DMA ring.
+	if (ret < 0) {
+		WARN_ON(ret == -ENOMEM);
+		page_pool_recycle_direct(pool, new_page);
+	}
+}
+
+
+
+   
+
+

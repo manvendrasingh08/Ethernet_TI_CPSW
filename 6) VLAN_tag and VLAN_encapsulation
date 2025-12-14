@@ -1,0 +1,24 @@
+What is VLAN Encapsulation?
+
+VLAN encapsulation refers to the process of wrapping Ethernet frames with a VLAN tag to allow them to be properly identified and forwarded by network devices based on their VLAN membership. This process essentially involves adding the VLAN tag to the Ethernet frame (as described above) so that network devices (such as switches and routers) know how to handle the packet.
+
+Why is VLAN Encapsulation Important?
+
+Network Segmentation: VLAN encapsulation allows administrators to create logical groupings of devices and users within a network, even if they are physically on the same infrastructure. For example, a network can have VLANs for different departments (e.g., Sales, HR, IT) to logically separate the traffic.
+
+Traffic Isolation: VLANs help isolate traffic between different groups of devices, improving security by ensuring that devices on different VLANs cannot directly communicate with each other without routing.
+
+
+VLAN Tag
+===========
+
+In an Ethernet frame with VLAN tagging, the tag is inserted between the source MAC address and the Ethernet type/length field. The tag adds 4 bytes of overhead to the frame.
+
+Before Encapsulation:
+
+| Destination MAC | Source MAC | Ethernet Type | Payload | CRC |
+
+After Encapsulation:: 
+
+| Destination MAC | Source MAC | VLAN Tag | Ethernet Type | Payload | CRC |
+
