@@ -1,0 +1,123 @@
+============================================================
+WHERE DOES THE PACKET WAIT WHEN TX QUEUE IS STOPPED?
+============================================================
+
+There are TWO different waiting places.
+Which one is used depends on HOW FAR the packet has progressed
+in the networking stack.
+
+
+============================================================
+3) CASE A: Packet has NOT reached dev_queue_xmit()
+============================================================
+
+--- Layer
+    Layer 4 (TCP / UDP)
+
+--- TCP case
+    Packet is stored in:
+
+        struct sock
+            └── sk_write_queue
+
+    Reasons this happens:
+        - Congestion window (cwnd) full
+        - Receiver advertised window closed
+        - Nagle algorithm enabled
+        - TCP corking
+        - TCP pacing
+
+    Notes:
+        - Packet has NOT reached IP output yet
+        - No L2 header added
+        - No qdisc involved
+        - NO relation to TX queue stop
+        - netif_tx_stop_queue() is NOT visible here
+
+
+--- UDP case
+    Packet may briefly be stored in:
+
+        struct sock
+            └── sk_write_queue
+
+    Notes:
+        - UDP usually pushes packets quickly to IP
+        - Minimal buffering compared to TCP
+        - Still unrelated to TX queue stop
+
+
+============================================================
+4) CASE B: Packet HAS reached dev_queue_xmit()
+============================================================
+
+--- Stack position
+    Below Layer 3 (IP)
+    Layer 2 / netdevice layer
+
+--- Call flow
+    ip_local_out()
+        ↓
+    ip_output()
+        ↓
+    dev_queue_xmit()
+
+
+--- Inside dev_queue_xmit()
+    1) Selects qdisc (pfifo_fast, fq, fq_codel, etc.)
+    2) Enqueues skb into qdisc queue
+    3) Attempts to dequeue skb
+    4) Attempts to call ndo_start_xmit()
+
+
+--- TX queue stopped case
+    Condition:
+        Driver has called:
+
+            netif_tx_stop_queue(txq)
+
+    Result:
+        - qdisc will NOT call ndo_start_xmit()
+        - skb remains queued in qdisc
+        - skb is NOT returned to TCP
+        - skb is NOT stored in sk_write_queue
+
+
+--- Packet state here
+    - skb is fully formed
+        * L4 header present
+        * IP header present
+        * Ethernet header present
+    - Routing already done
+    - Neighbor resolution already done
+    - Layer 4 is completely out of the picture
+
+
+============================================================
+SUMMARY
+============================================================
+
+- Layer 4 buffering:
+    Location:
+        sk->sk_write_queue
+    Reason:
+        TCP/UDP flow control
+    Relation to TX queue stop:
+        NONE
+
+- Netdevice buffering:
+    Location:
+        qdisc queue
+    Reason:
+        TX queue stopped (hardware/DMA full)
+    Relation to TX queue stop:
+        DIRECT
+
+- TX queue stop is checked ONLY in:
+    dev_queue_xmit() / qdisc layer
+
+- TCP/UDP NEVER know:
+    - netdev_tx_queue
+    - TX ring state
+    - DMA descriptor availability
+
