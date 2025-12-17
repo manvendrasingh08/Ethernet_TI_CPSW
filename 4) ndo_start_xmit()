@@ -170,12 +170,149 @@ Flow of the Code (High-level Steps)
 				netif_tx_wake_queue(txq);
 }											````
 
-	>What happens here?: This checks if there are free transmission descriptors available in the DMA channel. If there are no free
-	 descriptors, the transmit queue is stopped using netif_tx_stop_queue(txq).
 
-	>Why the barrier?: smp_mb__after_atomic() ensures that the stop operation is visible to other CPUs before proceeding.
 
-	>Resuming transmission: If descriptors become available again, netif_tx_wake_queue(txq) is called to resume transmission.
+		============================================================
+		STEP 1: cpdma_check_free_tx_desc(txch)
+		============================================================
+
+		--- What this function does
+			Checks whether the DMA TX ring has any FREE descriptors.
+
+		--- Background
+			- Hardware TX DMA rings are FINITE.
+			- Typical sizes:
+				* 64 descriptors
+				* 128 descriptors
+				* 256 descriptors
+
+		--- When all descriptors are in use
+			- DMA engine is still transmitting previous packets
+			- No descriptor is available for a new packet
+			- Driver CANNOT submit a new skb
+
+		--- Condition check
+			Expression:
+				!cpdma_check_free_tx_desc(txch)
+
+			Meaning:
+				"There are NO free TX descriptors.
+				 The hardware DMA ring is FULL."
+
+		--- unlikely()
+			Purpose:
+				Compiler branch prediction hint
+
+			Meaning:
+				This condition is expected to be RARE.
+				Optimize for the fast path where descriptors ARE available.
+
+
+		============================================================
+		STEP 2: netif_tx_stop_queue(txq)
+		============================================================
+
+		--- What this function does
+			Stops the SOFTWARE transmit queue for this netdev queue.
+
+		--- Purpose
+			- Prevent kernel networking stack from sending more skbs
+			- Avoid overflowing the hardware DMA ring
+			- Apply backpressure from hardware to the kernel
+
+		--- Mechanism
+			- Marks the netdev_tx_queue as STOPPED
+			- Kernel checks this flag before calling ndo_start_xmit()
+
+		--- Effect
+			- dev_queue_xmit() / qdisc will NOT call ndo_start_xmit()
+			- New packets are NOT passed to the driver
+			- Packets will wait in qdisc
+
+		--- Analogy
+			Hardware:
+				Can handle only 5 packets at a time
+
+			Software queue:
+				Waiting line
+
+			Action:
+				If hardware is full,
+				stop allowing new people into the line
+				until space is available
+
+
+		============================================================
+		STEP 3: smp_mb__after_atomic()
+		============================================================
+
+		--- What this is
+			A memory barrier (SMP memory ordering primitive)
+
+		--- Why it is needed
+			- Ensures stop_queue state is visible to ALL CPUs
+			- Prevents reordering of memory operations
+			- Guarantees correct synchronization
+
+		--- Even on BBB (single-core)
+			- Code is written to be SMP-safe
+			- Same driver runs on multi-core systems
+			- Barrier ensures correctness everywhere
+
+		--- Guarantee provided
+			Any CPU that tries to enqueue packets AFTER this
+			will see that the TX queue is STOPPED
+
+
+		============================================================
+		STEP 4: Re-check and possibly wake queue
+		============================================================
+
+		--- Code
+			if (cpdma_check_free_tx_desc(txch))
+				netif_tx_wake_queue(txq);
+
+		--- Why re-check?
+			Possible race condition:
+
+				- While stopping the queue
+				- Another packet may have completed transmission
+				- A TX descriptor may have been freed
+
+		--- What this means
+			- Hardware may NOW have free space
+			- No need to keep TX queue stopped
+
+		--- Action
+			- Wake the software TX queue immediately
+			- Allow kernel to resume packet transmission
+
+		--- Result
+			- Avoid unnecessary queue stop
+			- Reduce latency
+			- Improve throughput
+
+
+		============================================================
+		FINAL SUMMARY
+		============================================================
+
+		- cpdma_check_free_tx_desc()
+			Checks hardware capacity
+
+		- netif_tx_stop_queue()
+			Applies backpressure to kernel
+
+		- smp_mb__after_atomic()
+			Ensures visibility and ordering
+
+		- netif_tx_wake_queue()
+			Resumes transmission when space is available
+
+		- Combined effect
+			Safe, efficient, race-free TX flow control
+			between kernel software queues and hardware DMA rings
+
 
 
 9) Return Status:
