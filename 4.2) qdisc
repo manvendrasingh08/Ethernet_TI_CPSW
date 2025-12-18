@@ -1,0 +1,279 @@
+============================================================
+QDISC (QUEUEING DISCIPLINE) — COMPLETE DETAILED EXPLANATION
+============================================================
+
+
+============================================================
+1) WHAT IS QDISC?
+============================================================
+
+--- Definition
+    qdisc (Queueing Discipline) is the Linux kernel's
+    SOFTWARE TRANSMIT SCHEDULER.
+
+--- What it provides
+    - Packet buffering
+    - Packet scheduling
+    - Traffic shaping
+    - Fairness between flows
+    - Backpressure handling between kernel and NIC driver
+
+--- Layer position
+    - Below Layer 3 (IP)
+    - Above NIC driver
+    - Often called "Layer 2.5"
+
+--- Important clarification
+    qdisc is NOT a single algorithm.
+    qdisc is a FRAMEWORK that supports multiple algorithms.
+
+
+============================================================
+2) WHY QDISC EXISTS
+============================================================
+
+--- Problem without qdisc
+    - Applications can generate packets faster than NIC can send
+    - Hardware DMA rings are small and finite
+    - Driver should not block or sleep
+    - No fairness between flows
+    - No traffic shaping or policy enforcement
+
+--- Solution
+    Insert a SOFTWARE QUEUE + SCHEDULER
+    between IP and the driver.
+
+--- That solution is qdisc.
+
+
+============================================================
+3) WHERE QDISC SITS IN THE TX FLOW
+============================================================
+
+--- Full TX call path
+    Application
+        ↓
+    TCP / UDP (Layer 4)
+        ↓
+    IP (Layer 3)
+        ↓
+    ip_local_out()
+        ↓
+    ip_output()
+        ↓
+    dev_queue_xmit()
+        ↓
+    qdisc_enqueue()          ← qdisc begins
+        ↓
+    qdisc_dequeue()
+        ↓
+    ndo_start_xmit()         ← NIC driver
+        ↓
+    DMA TX ring
+        ↓
+    NIC hardware
+
+
+============================================================
+4) WHAT QDISC DOES INTERNALLY
+============================================================
+
+--- 4.1 Packet buffering
+    - Stores skbs in software queues
+    - Prevents packet drops when NIC is busy
+    - Acts as shock absorber between kernel and hardware
+
+--- 4.2 Packet scheduling
+    - Decides which packet goes next
+    - May reorder packets based on policy
+    - Examples:
+        * FIFO
+        * Round-robin
+        * Priority-based
+        * Fair sharing
+
+--- 4.3 Traffic shaping
+    - Rate limiting
+    - Bandwidth control
+    - Artificial delays
+
+--- 4.4 Traffic policing
+    - Drop packets exceeding policy
+    - Enforce QoS rules
+
+--- 4.5 Flow control integration
+    - Honors netif_tx_stop_queue()
+    - Stops dequeuing when driver is busy
+    - Resumes when netif_tx_wake_queue() is called
+
+
+============================================================
+5) WHAT HAPPENS WHEN TX QUEUE IS STOPPED
+============================================================
+
+--- Condition
+    Driver calls:
+        netif_tx_stop_queue(txq)
+
+--- Effect inside qdisc
+    - qdisc_enqueue() continues to accept skbs
+    - qdisc_dequeue() stops sending skbs to driver
+    - ndo_start_xmit() is NOT called
+
+--- Result
+    - skb remains queued inside qdisc
+    - skb is NOT returned to TCP
+    - skb is NOT stored in sk_write_queue
+    - Layer 4 is completely unaware
+
+
+============================================================
+6) PACKET STATE INSIDE QDISC
+============================================================
+
+--- skb contents
+    - Ethernet header present
+    - IP header present
+    - TCP / UDP header present
+    - Payload present
+
+--- Processing already done
+    - Routing decision complete
+    - Neighbor resolution complete
+    - Netfilter POST_ROUTING complete
+
+--- Missing step
+    - Submission to NIC driver via ndo_start_xmit()
+
+
+============================================================
+7) QDISC TYPES (IMPLEMENTATIONS)
+============================================================
+
+--- Common qdiscs
+    pfifo_fast
+    fq
+    fq_codel
+    tbf
+    netem
+    mq
+
+--- Important point
+    ALL of the above are qdisc IMPLEMENTATIONS,
+    NOT replacements for qdisc itself.
+
+
+============================================================
+8) FQ (FAIR QUEUEING) QDISC
+============================================================
+
+--- What fq is
+    fq is a SPECIFIC qdisc implementation.
+
+--- What fq solves
+    - Prevents single flow domination
+    - Provides per-flow fairness
+    - Reduces latency under load
+
+--- Key idea
+    One queue per flow instead of one global queue.
+
+
+============================================================
+9) HOW FQ WORKS INTERNALLY
+============================================================
+
+--- Flow classification
+    Each skb is hashed using:
+        - Source IP
+        - Destination IP
+        - Source port
+        - Destination port
+        - Protocol
+
+--- Data structure
+    flow_hash → per-flow queue
+
+--- Enqueue path
+    fq_enqueue():
+        - Identify flow
+        - Enqueue skb into that flow's queue
+
+--- Dequeue path
+    fq_dequeue():
+        - Pick next active flow (round-robin)
+        - Dequeue ONE skb
+        - Send skb to ndo_start_xmit()
+
+
+============================================================
+10) WHY FQ IS BETTER THAN PFIFO_FAST
+============================================================
+
+--- pfifo_fast problems
+    - Single global queue
+    - Greedy flow can starve others
+    - High latency (bufferbloat)
+
+--- fq advantages
+    - Per-flow isolation
+    - Fair bandwidth sharing
+    - Lower latency
+    - Better interactive performance
+
+
+============================================================
+11) FQ VS FQ_CODEL
+============================================================
+
+--- fq
+    - Fair queueing
+    - No active queue management
+    - Simple drop logic
+
+--- fq_codel
+    - Fair queueing
+    - CoDel AQM (latency control)
+    - Smarter drop decisions
+
+--- Default choice
+    Modern Linux uses fq_codel by default
+
+
+============================================================
+12) IMPORTANT RELATIONSHIPS (DO NOT CONFUSE)
+============================================================
+
+--- qdisc
+    Framework / infrastructure
+
+--- fq
+    One qdisc implementation
+
+--- netdev_tx_queue
+    Driver-facing software queue state
+
+--- DMA TX ring
+    Hardware descriptor queue
+
+
+============================================================
+13) ONE-LINE MENTAL MODEL
+============================================================
+
+    qdisc is the TRAFFIC CONTROLLER
+    fq is ONE POLICY used by that controller
+
+
+============================================================
+14) FINAL SUMMARY
+============================================================
+
+- qdisc is mandatory for TX scheduling
+- fq is NOT a replacement for qdisc
+- fq IS a qdisc implementation
+- qdisc buffers packets and applies policy
+- fq ensures fairness between flows
+- Driver only sees packets AFTER qdisc
+- TX queue stop affects qdisc, not TCP
+
