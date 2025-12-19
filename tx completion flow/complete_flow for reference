@@ -1,0 +1,176 @@
+🔵 HIGH-LEVEL FLOW (TX path – CPSW + CPDMA)
+User / Kernel
+   |
+   v
+ndo_start_xmit()
+   |
+   v
+cpdma_chan_submit()
+   |
+   v
+DMA Engine (CPDMA)
+   |
+   v
+MAC → PHY → Wire
+   |
+   v
+TX Interrupt
+   |
+   v
+NAPI Poll (NET_RX_SOFTIRQ)
+   |
+   v
+TX Descriptor Cleanup
+   |
+   v
+skb Free (NET_TX_SOFTIRQ)
+
+🟢 DETAILED FLOW CHART (WITH CONTEXTS)
+1️⃣ Packet handed to driver
+
+📍 Context: Process / softirq (NET_TX_SOFTIRQ)
+
+netif_send_skb()
+   |
+ndo_start_xmit(skb)
+   |
+cpsw_ndo_start_xmit()
+
+
+Driver decides TX channel and submits packet.
+
+2️⃣ Descriptor creation & DMA mapping
+
+📍 Context: Same as above
+
+cpdma_chan_submit()
+   |
+spin_lock(chan->lock)
+   |
+cpdma_chan_submit_si()
+   |
+ ├─ dma_map_single()   → get DMA address
+ ├─ fill CPDMA descriptor:
+ |    - hw_buffer = DMA addr
+ |    - hw_len
+ |    - hw_mode (OWNER | SOP | EOP)
+ |    - sw_token = skb
+ |
+ └─ __cpdma_chan_submit()
+        |
+        ├─ if channel idle:
+        |     write HDP register
+        |
+        └─ else:
+              chain descriptor
+
+
+➡️ DMA engine now owns the descriptor
+
+3️⃣ DMA Engine transfers packet
+
+📍 Context: Hardware (no CPU)
+
+CPDMA reads descriptor
+   |
+Bus transaction (AXI/L3)
+   |
+Fetch packet from RAM
+   |
+Push data into MAC TX FIFO
+   |
+MAC → PHY → Ethernet wire
+
+
+No copying. No CPU involvement.
+
+4️⃣ DMA finishes TX → Interrupt
+
+📍 Context: HARD IRQ
+
+CPDMA clears OWNER bit
+   |
+TX interrupt asserted
+   |
+cpsw_tx_interrupt()
+
+
+Minimal work only:
+
+cpsw_tx_interrupt()
+   |
+disable/ack TX IRQ
+   |
+napi_schedule(&napi_tx)
+
+
+🚨 No descriptor cleanup here
+
+5️⃣ NAPI scheduled → NET_RX_SOFTIRQ
+
+📍 Context: SOFTIRQ (NET_RX_SOFTIRQ)
+
+NET_RX_SOFTIRQ raised
+   |
+__do_softirq()
+   |
+net_rx_action()
+   |
+napi_poll()
+
+6️⃣ NAPI poll → TX completion
+
+📍 Context: NET_RX_SOFTIRQ
+
+napi_poll()
+   |
+napi->poll()
+   |
+cpsw_tx_poll()
+   |
+cpdma_chan_process()
+
+
+For each completed TX descriptor:
+
+__cpdma_chan_free()
+   |
+ ├─ read sw_token (skb)
+ ├─ dma_unmap_single()
+ ├─ cpdma_desc_free()
+ └─ cpsw_tx_handler(skb)
+
+7️⃣ TX handler (driver level)
+
+📍 Context: NET_RX_SOFTIRQ
+
+cpsw_tx_handler()
+   |
+dev_kfree_skb_any(skb)
+   |
+update tx stats
+   |
+netif_tx_wake_queue()
+
+
+dev_kfree_skb_any() decides where to free:
+
+8️⃣ skb deferred free → NET_TX_SOFTIRQ
+
+📍 Context: SOFTIRQ (NET_TX_SOFTIRQ)
+
+__dev_kfree_skb_irq()
+   |
+queue skb on completion_queue
+   |
+raise NET_TX_SOFTIRQ
+
+9️⃣ Final skb destruction
+
+📍 Context: NET_TX_SOFTIRQ
+
+net_tx_action()
+   |
+process completion_queue
+   |
+__kfree_skb()
