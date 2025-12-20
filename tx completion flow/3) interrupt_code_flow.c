@@ -185,7 +185,7 @@ static __latent_entropy void net_rx_action(struct softirq_action *h)
 
 
 
-// below block handles the rescheduling if teh work is still left adds the list to repoll and raise the NET_RX_SOFTIRQ again with repoll list.
+//  block below handles the rescheduling if teh work is still left adds the list to repoll and raise the NET_RX_SOFTIRQ again with repoll list.
 
 	local_irq_disable();
 
@@ -212,11 +212,16 @@ present in dev.c
 static int napi_poll(struct napi_struct *n, struct list_head *repoll)
 {
 	void *have;
-	int work, weight;
+	int work; //work → number of packets (or descriptors) processed by this poll.
+	int weight; // weight → the maximum budget for this poll (from n->weight).
 
-	list_del_init(&n->poll_list);
+	list_del_init(&n->poll_list);  /* removes this NAPI instance from the list atomically and re-initializes the node.
+									This prevents the same NAPI instance from being polled twice while it is being processed.  */
 
-	have = netpoll_poll_lock(n);
+	have = netpoll_poll_lock(n);  /* What this lock is:
+		Used to avoid races between normal NAPI polling and netpoll (console) polling.
+		Some NAPI instances may also be polled by netpoll_poll() if the system is running low-level debugging (like sending logs via network).
+		The lock ensures that only one poller touches this NAPI instance at a time. */
 
 	weight = n->weight;
 
@@ -228,9 +233,15 @@ static int napi_poll(struct napi_struct *n, struct list_head *repoll)
 	 */
 	work = 0;
 	if (test_bit(NAPI_STATE_SCHED, &n->state)) {
-			work = n->poll(n, weight);
+			work = n->poll(n, weight);   // for Tx this becomes :  work = cpsw_tx_poll(n, weight);
 		trace_napi_poll(n, work, weight);
 	}
+	/*  it calls the poll fucntion for tx -> cpsw_tx_poll and then also traces and  Records: 
+			Which NAPI instance was polled
+
+			How much work was done
+			Its weight (budget)
+			Useful for tuning NAPI, detecting misbehaving drivers, or debugging network stalls.		*/
 
 	if (unlikely(work > weight))
 		pr_err_once("NAPI poll function %pS returned %d, exceeding its budget of %d.\n",
@@ -244,9 +255,9 @@ static int napi_poll(struct napi_struct *n, struct list_head *repoll)
 	 * still "owns" the NAPI instance and therefore can
 	 * move the instance around on the list at-will.
 	 */
-	if (unlikely(napi_disable_pending(n))) {
-		napi_complete(n);
-		goto out_unlock;
+	if (unlikely(napi_disable_pending(n))) {   //hecks if napi_disable() was called by the driver while this NAPI was running.
+		napi_complete(n);//Clears NAPI_STATE_SCHED, Marks NAPI as idle, Lets it be scheduled again later only if napi_schedule() is called
+		goto out_unlock;  
 	}
 
 	if (n->gro_bitmask) {
@@ -260,6 +271,11 @@ static int napi_poll(struct napi_struct *n, struct list_head *repoll)
 
 	/* Some drivers may have called napi_schedule
 	 * prior to exhausting their budget.
+	 
+	 Kernel warns with pr_warn_once because:
+
+		Polling already consumed full budget.
+		Rescheduling happened, so remaining work will be deferred.
 	 */
 	if (unlikely(!list_empty(&n->poll_list))) {
 		pr_warn_once("%s: Budget exhausted after napi rescheduled\n",
@@ -270,9 +286,9 @@ static int napi_poll(struct napi_struct *n, struct list_head *repoll)
 	list_add_tail(&n->poll_list, repoll);
 
 out_unlock:
-	netpoll_poll_unlock(have);
+	netpoll_poll_unlock(have); // unlocking the lock held in the start for two pollers to rpevent from the same list.
 
-	return work;
+	return work;  // to net_rx_action()
 }
 
 
