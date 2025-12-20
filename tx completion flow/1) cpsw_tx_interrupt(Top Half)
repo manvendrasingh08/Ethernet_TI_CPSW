@@ -1,0 +1,31 @@
+
+irqreturn_t cpsw_tx_interrupt(int irq, void *dev_id)
+{
+	struct cpsw_common *cpsw = dev_id;
+
+	writel(0, &cpsw->wr_regs->tx_en);   // disable the tx interrupts by putting 0 in tx_en register.
+	cpdma_ctlr_eoi(cpsw->dma, CPDMA_EOI_TX);  // it provides the eacknowledgement that the interrupt ha sbeen recieved to teh source.
+
+	if (cpsw->quirk_irq) {
+		disable_irq_nosync(cpsw->irqs_table[1]);
+		cpsw->tx_irq_disabled = true;
+	}
+	
+	/*
+	
+		Disables the TX interrupt line at the Linux IRQ subsystem level.
+		irqs_table[1] → TX interrupt number (index 1 = TX).
+
+	nosync means:
+
+		Do not wait for any currently running interrupt handlers
+		Disable immediately bcoz We are already inside an interrupt handler
+
+		and marking  **tx_irq_disabled  = true ** for cpu to keep state check
+									 */
+	
+
+
+	napi_schedule(&cpsw->napi_tx);
+	return IRQ_HANDLED;
+}
