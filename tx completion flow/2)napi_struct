@@ -1,0 +1,73 @@
+/* struct napi_struct (Linux kernel networking) */
+/* NOTE: Exact fields may vary slightly by kernel version */
+
+struct napi_struct {
+
+    struct list_head poll_list;
+									/*
+									 * Linked-list node.
+									 * Used by the kernel to put this NAPI instance
+									 * on the per-CPU NAPI poll list.
+									 */
+
+    unsigned long state;
+									/*
+									 * NAPI state flags.
+									 * Examples:
+									 * - NAPI_STATE_SCHED  : scheduled for polling
+									 * - NAPI_STATE_DISABLE: disabled
+									 */
+
+    int weight;
+									/*
+									 * Maximum number of packets/descriptors
+									 * this NAPI instance is allowed to process
+									 * in one poll cycle (budget).
+									 */
+
+    int (*poll)(struct napi_struct *napi, int budget);
+									/*
+									 * Driver-provided poll function.
+									 * Called in softirq context to do RX/TX work.
+									 */
+
+    struct net_device *dev;
+									/*
+									 * Network device this NAPI instance belongs to.
+									 */
+
+    struct list_head dev_list;
+									/*
+									 * Links this NAPI instance into the net_device’s
+									 * list of NAPI contexts.
+									 */
+
+    unsigned long gro_bitmask;
+									/*
+									 * Used by GRO (Generic Receive Offload)
+									 * to optimize packet aggregation.
+									 */
+
+    int napi_id;
+									/*
+									 * Unique ID for this NAPI instance.
+									 * Used for steering, debugging, and tracing.
+									 */
+
+#ifdef CONFIG_NETPOLL
+    spinlock_t poll_lock;
+    /*
+     * Lock used when netpoll is enabled
+     * (e.g., for network debugging).
+     */
+#endif
+
+#ifdef CONFIG_SMP
+    int cpu;
+    /*
+     * CPU this NAPI instance is currently associated with.
+     * Helps with CPU affinity and load balancing.
+     */
+#endif
+};
+
