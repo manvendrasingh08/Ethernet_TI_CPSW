@@ -3,7 +3,7 @@ irqreturn_t cpsw_tx_interrupt(int irq, void *dev_id)
 {
 	struct cpsw_common *cpsw = dev_id;
 
-	writel(0, &cpsw->wr_regs->tx_en);   // disable the tx interrupts by putting 0 in tx_en register.
+	writel(0, &cpsw->wr_regs->tx_en);   // disable the tx interrupts by putting 0 in tx_en register.  🛑️Complete flow in "4)" file.
 	cpdma_ctlr_eoi(cpsw->dma, CPDMA_EOI_TX);  // it provides the eacknowledgement that the interrupt ha sbeen recieved to teh source.
 
 	if (cpsw->quirk_irq) {
@@ -26,7 +26,7 @@ irqreturn_t cpsw_tx_interrupt(int irq, void *dev_id)
 	
 
 
-	napi_schedule(&cpsw->napi_tx);
+	napi_schedule(&cpsw->napi_tx);  // mapped to cpsw_tx_poll fucntion through netif_napi_add()
 	return IRQ_HANDLED;
 }
 
@@ -212,7 +212,7 @@ present in dev.c
 static int napi_poll(struct napi_struct *n, struct list_head *repoll)
 {
 	void *have;
-	int work; //work → number of packets (or descriptors) processed by this poll.
+	int work; //work → for storing number of packets (or descriptors) processed by this poll.
 	int weight; // weight → the maximum budget for this poll (from n->weight).
 
 	list_del_init(&n->poll_list);  /* removes this NAPI instance from the list atomically and re-initializes the node.
@@ -302,18 +302,31 @@ int cpsw_tx_poll(struct napi_struct *napi_tx, int budget)
 {
 	struct cpsw_common *cpsw = napi_to_cpsw(napi_tx);
 	int num_tx;
+	/* 
+	 napi_to_cpsw(napi_tx) → converts the napi_struct pointer to the CPSW driver’s private structure.
 
-	num_tx = cpdma_chan_process(cpsw->txv[0].ch, budget);
+		Why:
+		struct cpsw_commoncontains all state for the CPSW device:
+
+				TX channels
+				IRQ info
+				Registers
+		This allows the poll function to access the hardware state.
+
+		int num_tx;→ number of descriptors actually processed in this poll.*/
+	
+
+	num_tx = cpdma_chan_process(cpsw->txv[0].ch, budget);  // num->tx = how many descriptors were actually processed.
 	if (num_tx < budget) {
 		napi_complete(napi_tx);
-		writel(0xff, &cpsw->wr_regs->tx_en);
+		writel(0xff, &cpsw->wr_regs->tx_en);  //🛑️tx interrupts are enabled here
 		if (cpsw->tx_irq_disabled) {
-			cpsw->tx_irq_disabled = false;
+			cpsw->tx_irq_disabled = false;   // making tge irq_disabled field false that was earlier made true.
 			enable_irq(cpsw->irqs_table[1]);
 		}
 	}
 
-	return num_tx;
+	return num_tx;  // to napi_poll()
 }
 
 
@@ -322,7 +335,7 @@ int cpsw_tx_poll(struct napi_struct *napi_tx, int budget)
 in davinci .c
 ==============
 
-int cpdma_chan_process(struct cpdma_chan *chan, int quota)
+int cpdma_chan_process(struct cpdma_chan *chan, int quota)  //quota here is budget
 {
 	int used = 0, ret = 0;
 
@@ -362,11 +375,11 @@ static int __cpdma_chan_process(struct cpdma_chan *chan)
 		status = -ENOENT;
 		goto unlock_ret;
 	}
-	desc_dma = desc_phys(pool, desc);
+	desc_dma = desc_phys(pool, desc);		//converting cpu pointer to dma-addr
 
-	status	= desc_read(desc, hw_mode);
-	outlen	= status & 0x7ff;
-	if (status & CPDMA_DESC_OWNER) {
+	status	= desc_read(desc, hw_mode);		// reading the mode field of the desc -> owner bit, length, EOQ, completion flags
+	outlen	= status & 0x7ff;				// finding the packet length
+	if (status & CPDMA_DESC_OWNER) {		// 🛑️checks if hardware is still the owner (1 -> hardware, 0 -> CPU)
 		chan->stats.busy_dequeue++;
 		status = -EBUSY;
 		goto unlock_ret;
@@ -379,14 +392,15 @@ static int __cpdma_chan_process(struct cpdma_chan *chan)
 			    CPDMA_DESC_PORT_MASK | CPDMA_RX_VLAN_ENCAP);
 
 	chan->head = desc_from_phys(pool, desc_read(desc, hw_next));
-	chan_write(chan, cp, desc_dma);
-	chan->count--;
+	chan_write(chan, cp, desc_dma);     // DMA completeion pointer (cp) register is written so that hardware knows software has processed it
+	chan->count--;							
 	chan->stats.good_dequeue++;
 
-	if ((status & CPDMA_DESC_EOQ) && chan->head) {
+	if ((status & CPDMA_DESC_EOQ) && chan->head) {  //if the hardware reached EOQ and software has added more desc meanwhile so write the hdp
 		chan->stats.requeue++;
 		chan_write(chan, hdp, desc_phys(pool, chan->head));
-	}
+	}  
+
 
 	spin_unlock_irqrestore(&chan->lock, flags);
 	if (unlikely(status & CPDMA_DESC_TD_COMPLETE))
@@ -402,6 +416,26 @@ unlock_ret:
 	return status;
 }
 
+
+/*
+		EXPLANATION OF cpdma_chan_process  &   __cpdma_chan_process
+	---------------------------------------------------------------
+	
+After cpsw_tx_poll() is called from napi_poll(), the handling goes into cpdma_chan_process().
+This function is responsible for processing completed TX DMA descriptors up to the given quota (budget). It maintains a counter called used, which represents the number of DMA descriptors that have been successfully completed by the hardware and reclaimed by the software during this poll cycle.
+
+There is a while loop that runs as long as **used < quota**. Inside this loop, __cpdma_chan_process() is called, which processes exactly one DMA descriptor per call.
+
+Inside __cpdma_chan_process(), the function first looks at the descriptor pointed to by chan->head, which is the current descriptor expected to be completed next. It reads the descriptor’s hardware OWNER bit from the mode field. If the OWNER bit is set, it means the hardware DMA engine still owns the descriptor and is actively transmitting, so it is not safe for the CPU to touch it. In this case, processing stops and control returns to the caller.
+
+If the OWNER bit is not set, it means the hardware has completed the DMA operation and it is now safe for the CPU to reclaim the descriptor. The function then extracts the transmitted packet length, adjusts it if the CRC was included, and advances the DMA ring by moving chan->head to the next descrhw_next field. It also updates the DMA completion pointer (CP) register to inform the hardware that this descriptor has been fully processed by software.
+
+At this point, the descriptor is considered successfully completed, so the internal descriptor count is decremented and DMA statistics are updated.
+
+If the descriptor has the EOQ (End Of Queue) bit set and there is still another descriptor present in the chain, it means the DMA engine stopped because it reached the end of the programmed queue even though more descriptors were alreadHDP (Head Descriptor Pointer) register to re-prime the DMA engine and continue transmission, preventing a TX stall.
+
+After releasing the channel lock, the function determines the appropriate callback status and then calls __cpdma_chan_free()
+*/
 
 8
 ==============
