@@ -534,6 +534,11 @@ void cpsw_tx_handler(void *token, int len, int status)
 	ndev->stats.tx_bytes += len;
 }
 
+/*     
+	cpsw_tx_handler()is the TX completion callback registered by the CPSW driver with the CPDMA TX channel, and it is invoked after the hardware has finished transmitting a packet and the corresponding DMA descriptor has been reclaimed and freed. The function receives an opaque token that represents the transmitted packet, along with the number of bytes txdp_return_frame(). Otherwise, the token is treated as a normal socket buffer (sk_buff), from which the network device and TX queue are obtained; hardware transmit timestamping is handled if enabled, and the SKB is safely released using dev_kfree_skb_any(), which defers freeing to the appropriate context if necessary. After freeing the packet memory, the function checks whether the corresponding TX queue was previously stopped due to lack of available TX descriptors, and if so, wakes the queue to allow new packets to be added.
+
+		*/
+
 10
 =========
 in dev.c
