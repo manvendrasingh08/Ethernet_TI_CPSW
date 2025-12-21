@@ -467,7 +467,7 @@ static void __cpdma_chan_free(struct cpdma_chan *chan,
 	}
 
 	cpdma_desc_free(pool, desc, 1);
-	(*chan->handler)((void *)token, outlen, status);
+	(*chan->handler)((void *)token, outlen, status);  //now this handler is set to cpsw_tx_handler in probe when creating the channel.
 }
 
 
@@ -493,12 +493,10 @@ At the end of this process, both the DMA buffer and the descriptor have been ful
 
  */
 
-now this handler is set to cpsw_tx_handler in probe when creating the channel.
-
-so here it is: 
 
 
-9
+9/* 
+Finally, the function calls the upper-layer completion handler (cpsw_tx_handler() for TX), passing the packet token, the number of bytes transmitted, and the transmission status. This notifies the network stack that the packet has been transmitted, allowing it to free the SKB or XDP frame, update transmission statistics, and wake the transmit queue if required.*/
 ===========
 in dev.c
 ===========
@@ -543,7 +541,7 @@ in dev.c
 
 
 void __dev_kfree_skb_any(struct sk_buff *skb, enum skb_free_reason reason)
-{
+{		
 	if (in_irq() || irqs_disabled())
 		__dev_kfree_skb_irq(skb, reason);
 	else
@@ -551,6 +549,23 @@ void __dev_kfree_skb_any(struct sk_buff *skb, enum skb_free_reason reason)
 }
 EXPORT_SYMBOL(__dev_kfree_skb_any);
 
+
+/* An SKB can be freed from many contexts:
+
+		Hard IRQ (TX interrupt)
+		Softirq (NET_TX_SOFTIRQ)
+		Process context (system call, kthread)
+		
+		💥 Freeing an SKB incorrectly in the wrong context can crash the kernel. so linux provides this : 
+		
+		
+		it checks if the irq are enabled or disabled if any og the thing is true then it cannot free the skb immediately as kfree may sleep
+		or acquire lock and in softirq no sleeping should be there so it calls __dev_kfree_skb_irq. 
+		
+		and if called form the process context it just frees the skb immdiately using dev_kfree_skb.
+		
+		
+		*/
 
 11
 ==========
@@ -578,6 +593,38 @@ void __dev_kfree_skb_irq(struct sk_buff *skb, enum skb_free_reason reason)
 	raise_softirq_irqoff(NET_TX_SOFTIRQ);
 	local_irq_restore(flags);
 }
+
+/* 
+									Explanation of  __dev_kfree_skb_irq()
+								---------------------------------------------
+
+__dev_kfree_skb_irq() is the function that ultimately handles freeing an sk_buff when the free request occurs in IRQ context or with interrupts disabled.
+dev_kfree_skb_any() selects this function when it detects that the caller is running in interrupt context or when IRQs_cannot be freed immediately in these contexts.
+
+Inside __dev_kfree_skb_irq(), the function first checks whether the skb pointer is valid. It then examines the reference count (skb->users):
+
+	>If the reference count is exactly 1, this means the current context holds the last reference to the SKB.
+	 A read memory barriersmp_rmb()) is executed to ensure that all prior reads of SKB data complete before the reference count is set to
+	 zero. This prevents memory reordering issues on SMP systems.
+ 	 The reference count is then set to 0, marking the SKB as logically dead.
+
+	>If the reference count is greater than 1, the function simply decrements it.
+	 If other references still exist, the SKB must not be freed, so the function returns immediately.
+
+Once the SKB is confirmed to be freeable, the reason for freeing is stored in the SKB’s control buffer.
+
+The SKB is then added to a per-CPU completion queue (softnet_data.completion_queue).
+This is done by using skb->next to link the SKB into a singly linked list of SKBs waiting to be freed:
+
+skb->nextis set to the current head of the completion queue
+
+the completi
+
+Finally, NET_TX_SOFTIRQ is raised. This schedules net_tx_action() to run later in softirq context, where the SKBs in the completion queue are actually freed safely.
+
+This deferred-free mechanism ensures that SKBs are not freed directly in interrupt context, avoids locking and memory allocation in IRQ handlers, and provides safe and efficient cleanup on SMP systems
+
+ */
 
 12
 ========
