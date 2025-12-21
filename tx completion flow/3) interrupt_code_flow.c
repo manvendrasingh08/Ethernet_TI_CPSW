@@ -316,7 +316,7 @@ int cpsw_tx_poll(struct napi_struct *napi_tx, int budget)
 		int num_tx;→ number of descriptors actually processed in this poll.*/
 	
 
-	num_tx = cpdma_chan_process(cpsw->txv[0].ch, budget);  // num->tx = how many descriptors were actually processed.
+	num_tx = cpdma_chan_process(cpsw->txv[0].ch, budget);  // num->tx = how many descriptors were actually processed. 
 	if (num_tx < budget) {
 		napi_complete(napi_tx);
 		writel(0xff, &cpsw->wr_regs->tx_en);  //🛑️tx interrupts are enabled here
@@ -469,6 +469,29 @@ static void __cpdma_chan_free(struct cpdma_chan *chan,
 	cpdma_desc_free(pool, desc, 1);
 	(*chan->handler)((void *)token, outlen, status);
 }
+
+
+/* 
+ 					**Explanation of __cpdma_chan_free()
+ 				------------------------------------------
+
+After the hardware clears the descriptor’s OWNER bit, indicating that ownership has transitioned from the hardware DMA engine to the CPU, the descriptor is passed to __cpdma_chan_free() for final cleanup.
+
+Inside __cpdma_chan_free(), the function first retrieves the DMA controller (ctlr) and reads the software-maintained fields stored in the descriptor. These fields include the original buffer length of the Ethernet frame and the DMA address of the buffer that was previously mapped using dma_map_single() (or a related DMA mapping API used when the descriptor was prepared).
+
+Next, the function checks whether the buffer was mapped using an external DMA mapping, which is indicated by the CPDMA_DMA_EXT_MAP flag. This flag means that the DMA mapping was not created by this driver and that the buffer already existed in a DMA-mapped state (for example, pre-mapped memory or shared DMA-capable memory). In this case, th_not unmap the buffer, but instead performs dma_sync_single_for_cpu() to ensure cache coherency so that the CPU can safely access the buffer contents.
+
+If the buffer was not externally mapped, then it was mapped by the driver itself using dma_map_single(), and therefore it must be properly released using dma_unmap_single(). This removes the DMA mapping and ensures there are no cache incoherency issues or DMA resource leaks.
+
+After this step, the DMA engine no longer has any association with the buffer, and although the descriptor may still contain the old DMA address value, that address is no longer valid or usable.
+
+The descriptor itself is then returned to the descriptor pool using cpdma_desc_free(pool, desc, 1), making it available for reuse in future transmissions. At this point, the descriptor is fully reclaimed, and its contents are considered invalid until it is reinitialized for a new packet.
+
+Finally, the function calls the upper-layer completion handler (cpsw_tx_handler() for TX), passing the packet token, the number of bytes transmitted, and the transmission status. This notifies the network stack that the packet has been transmitted, allowing it to free the SKB or XDP frame, update transmission statistics, and wake the transmit queue if required.
+
+At the end of this process, both the DMA buffer and the descriptor have been fully released, and the TX completion for that packet is complete.
+
+ */
 
 now this handler is set to cpsw_tx_handler in probe when creating the channel.
 
