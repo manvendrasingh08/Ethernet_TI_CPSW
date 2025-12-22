@@ -599,6 +599,8 @@ void __dev_kfree_skb_irq(struct sk_buff *skb, enum skb_free_reason reason)
 	local_irq_restore(flags);
 }
 
+//  					------------------------softirq of NET_RX_SOFTIRQ ends here--------------------------
+
 /* 
 									Explanation of  __dev_kfree_skb_irq()
 								---------------------------------------------
@@ -621,7 +623,7 @@ Once the SKB is confirmed to be freeable, the reason for freeing is stored in th
 The SKB is then added to a per-CPU completion queue (softnet_data.completion_queue).
 This is done by using skb->next to link the SKB into a singly linked list of SKBs waiting to be freed:
 
-skb->nextis set to the current head of the completion queue
+skb->next is set to the current head of the completion queue
 
 the completi
 
@@ -719,3 +721,94 @@ static __latent_entropy void net_tx_action(struct softirq_action *h)
 
 	xfrm_dev_backlog(sd);
 }
+
+/*  
+		net_tx_action() is the handler for the NET_TX_SOFTIRQ and is responsible for completing all deferred transmit-side work that cannot be safely executed in interrupt context. The function operates on per-CPU data stored in struct softnet_data to avoid global locking and improve scalability. It first checks the per-CPU completion_queue, which holds socket buffers (sk_buff) that were previously queued for deferred freeing by functions such as __dev_kfree_skb_irq(). With local interrupts temporarily disabled, the function atomically detaches the entire completion queue into a local list and clears the per-CPU pointer to prevent races with producers. It then iterates over the list using the skb->next pointer, verifies that each SKB has a zero reference count, emits appropriate trace events based on the free reason, and frees the SKB either immediately using __kfree_skb() for complex or cloned buffers or via __kfree_skb_defer() for simple, non-cloned buffers to allow batched memory reclamation; once all queued SKBs have been processed, __kfree_skb_flush() is called to complete any deferred frees. After SKB cleanup, the function processes the per-CPU output_queue, which contains traffic control (qdisc) instances that were scheduled earlier but could not run immediately; again, with interrupts briefly disabled, the queue is detached, and each qdisc is executed under appropriate locking and RCU protection using qdisc_run() to resume packet transmission through the traffic control layer. Finally, the function invokes xfrm_dev_backlog()to process any pending IPsec transform backlog associated with transmit operations, ensuring that all deferred TX cleanup, scheduling, and protocol work for this CPU is completed before returning from the softirq.
+		
+		
+		MY explanation() : 
+		
+		This function processes the per-CPU TX completion queue, which contains SKBs that were deferred for freeing from interrupt context. It walks the queue one SKB at a time, verifies that the reference count is zero, and then frees the SKB. For simple, non-cloned SKBs it uses __kfree_skb_defer() to batch the memory free, while for cloned or more complex SKBs it uses __kfree_skb() to free them immediately. After all SKBs in the completion queue are handled, the function flushes any deferred frees.
+
+While running, the function also processes any pending qdiscs stored in the per-CPU output queue by calling qdisc_run(), which allows the traffic control layer to resume transmitting packets by pushing them down toward the device’s ndo_start_xmit() path.
+ */
+
+
+
+
+
+
+/*							 Explanation of all the below functions()
+							------------------------------------------------
+
+First, _kfree_skb_defer() retrieves a per-CPU napi_alloc_cache, which is a small cache used to batch SKB frees on a per-CPU basis. It then calls skb_release_all(), which performs all necessary cleanup except freeing the struct sk_buff itself. This includes running any SKB destructors, releasing protocol and socket state, unmapping and freeing the packet data buffer, releasing page-backed fragments, clearing zero-copy state, and freeing the SKB’s data head. At this point, the packet payload and all associated resources are completely released, and only the empty struct sk_buff object remains.
+
+After the packet contents are released, the now-empty SKB shell is stored in the per-CPU skb_cache array and the cache count is incremented. This means the SKB object is not freed immediately, but queued locally on the same CPU for later bulk freeing. If the cache reaches its maximum size (NAPI_SKB_CACHE_SIZE), all cached SKB objects are freed at once using kmem_cache_free_bulk(), which returns them to the slab allocator efficiently and with minimal locking. Any remaining cached SKBs will be freed later when the cache is flushed.
+
+In summary, this flow immediately frees everything that is large or externally visible (packet data, fragments, DMA-related state, protocol ownership) while deferring only the freeing of the small SKB object itself, allowing the kernel to batch slab frees, reduce allocator overhead, and improve cache locality. The end result is functionally identical to __kfree_skb(), but optimized for high-rate TX paths.  
+*/
+
+void __kfree_skb_defer(struct sk_buff *skb)
+{
+	_kfree_skb_defer(skb);
+}
+
+
+
+
+static inline void _kfree_skb_defer(struct sk_buff *skb)
+{
+	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+
+	/* drop skb->head and call any destructors for packet */
+	skb_release_all(skb);
+
+	/* record skb to CPU local list */
+	nc->skb_cache[nc->skb_count++] = skb;
+
+#ifdef CONFIG_SLUB
+	/* SLUB writes into objects when freeing */
+	prefetchw(skb);
+#endif
+
+	/* flush skb_cache if it is filled */
+	if (unlikely(nc->skb_count == NAPI_SKB_CACHE_SIZE)) {
+		kmem_cache_free_bulk(skbuff_head_cache, NAPI_SKB_CACHE_SIZE,
+				     nc->skb_cache);
+		nc->skb_count = 0;
+	}
+	
+}
+	
+	
+	
+/* Free everything but the sk_buff shell. */
+static void skb_release_all(struct sk_buff *skb)
+{
+	skb_release_head_state(skb);
+	if (likely(skb->head))
+		skb_release_data(skb);
+}
+
+
+static void skb_release_data(struct sk_buff *skb)
+{
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	int i;
+
+	if (skb->cloned &&
+	    atomic_sub_return(skb->nohdr ? (1 << SKB_DATAREF_SHIFT) + 1 : 1,
+			      &shinfo->dataref))
+		return;
+
+	for (i = 0; i < shinfo->nr_frags; i++)
+		__skb_frag_unref(&shinfo->frags[i]);
+
+	if (shinfo->frag_list)
+		kfree_skb_list(shinfo->frag_list);
+
+	skb_zcopy_clear(skb, true);
+	skb_free_head(skb);
+}
+
+
