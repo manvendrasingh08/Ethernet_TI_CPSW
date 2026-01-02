@@ -1,0 +1,136 @@
+
+TX_INTERRUPT HANDLER
+============================
+
+irq  : irq number
+dev_id :  pointer to a device-specific structure, cpsw, that contains the state and configuration information for the device.
+
+What happens in the function : 
+It writes 0 in the tx_en register. By writing 0 to this register, the **interrupt generation** for the TX path is disabled. This means the hardware will no longer generate interrupts while the current is being processed.
+
+It gives hardware the acknowledgment  that the interrupt has been processed. SO that it can trigger next interrupt but in this case they are disabled the interrupts will be generated once they are enabled
+
+With disable_irq_nosync() IRQ handling at the CPU / interrupt controller level is disbaled. .Basically this tells the IRQ subsytem that “Do not invoke the ISR for this IRQ anymore”.
+
+		The interrupt line may still be asserted by hardware   (if we would have not wrtiten 0 in tx_en register.)
+		The CPU will ignore this IRQ
+
+ for IRQ line 42 the interrupt is immediately disabled without waiting for any currently executing interrupt handlers to finish.
+ 
+nosync → does not wait for a currently running ISR to finish
+		Used inside interrupt context (safe)
+		Prevents re-entry of the ISR
+
+Marks  tx_irq_disabled  = true  for cpu to keep state check.
+
+Calls napi_schedule().
+
+
+
+POLLING FLOW
+==================
+
+---
+Linux uses a single softirq (NET_RX_SOFTIRQ) to drive all NAPI polling, as both RX and TX needs polling, for tx it is completion handling and for rx it is 
+packet processing which needs polling so it raises NET_RX_SOFTIRQ
+
+net_rx_action() is the central NAPI scheduler that is called when NET_RX_SOFTIRQ is raised in a deferred context instead of hard IRQs
+	What it does:
+		Iterates over the per-CPU NAPI poll list
+		Calls napi_poll() for each scheduled NAPI instance
+		Once all NAPI instances are processed or budgets are exhausted, it returns.
+		
+napi_poll() : 
+Each call to napi_poll() is passed a budget.
+what is budget? Its how many RX packets or TX completions are processed per poll cycle
+why it exists?  Prevent softirq from dominating the cpu and avoid user and other task starvation. For BBB its 300
+
+invokes each registered NAPI poll function.
+ 
+
+## 🔹 `net_rx_action()`
+
+`net_rx_action()` is the softirq handler executed when `NET_RX_SOFTIRQ` is raised.
+Its main role is to process all scheduled NAPI instances in a deferred context instead of hard IRQs.
+It iterates over the per-CPU poll list and i
+These poll functions handle **both RX packet reception and TX completion cleanup**.
+It enforces polling budgets to prevent CPU starvation and ensures fairness across devices.
+
+
+---
+
+## 🔹 `napi_poll()`
+
+`napi_poll()` is the generic function that invokes a driver’s NAPI poll callback.
+It passes a budget value that limits how many packets or completions can be processed in one run.
+The driver poll function processes RX packets and TX completions up to this budget.
+If all work is completed, NAPI polling is disabled and interrupts are re-enabled for the device.
+If work remains, NAPI stays scheduled and polling continues in the next softirq cycle.
+This mechanism reduces interrupt load and improves throughput under high traffic.
+
+---
+
+
+HOW A DESCRIPTOR IS FREED?
+===================================
+
+spin_lock_irqsave(&chan->lock, flags);
+chanel lock is acquired
+head descriptor is fetched from the chanel and its next is made the head
+status is acquired from the hw_mode and stored in status
+through this status owner bit is checked. if it is 1 dma is currntly processing it, marks that napi_instance is marked complete, returns to rx_action. sees if any napi instance present on the poll list and call the napi_poll() again
+
+cp register is written.  What is cp register ?
+The CP register is a per-channel hardware register used by the CPDMA engine.
+it is written so that hardware knows software has processed it
+What does hardware do when CP is written?
+											Hardware now knows: “Descriptors up to this address are no longer in use by software.
+											  So it can: Mark those descriptors as free, Reuse them for future DMA, ”
+Channel lock is released
+chanfree is called
+
+
+/* DMA completeion pointer (cp) register is written so that hardware knows software has processed it
+
+		The CP register is a per-channel hardware register used by the CPDMA engine.
+		
+		What does hardware do when CP is written?
+			Hardware now knows: “Descriptors up to this address are no longer in use by software.
+			  So it can: Mark those descriptors as free, Reuse them for future DMA, ”
+			  
+			  CP is a boundary marker. 
+											  
+											  */	
+											  
+											  
+											  
+											  
+How skb shells are processed? 
+==============================
+
+Now that the data of the packet is released and onlything remians the skb shell. We have to return  this skb shell to the slab aloocator gaian. Now returning them one by one would be very explensive so they are stored in the napi_alloc_cache. 
+Now what is napi_alloc_cache?
+
+napi_alloc_cache is a per-CPU fast-path cache used by the Linux networking stack to efficiently free skb shells by storing them in its feild skb_cache which will be then freed in bulk.
+Now it has two member fields one is skb_cache that stores the actual skb shells. It is an array of fixed size NAPI_SKB_CACHE_SIZE which is predefined.For BBB it is 64. Next is  skb_count that keeps the count of the present skb shells in the array.
+
+Now before freeing two things are done : 
+ 			First the prefetchw(skb) is called. What is this ? As we are abput to write into the skbuff present in cache during the bulk free, it changes the state of the cache line to exclusive. which means only current cpu will be modifying the cache line and no other cpu. It is beneficial as it saves time. Let say the cache line was used bu other cpu, the it had to first invalidate the the other cpu line and then change the state, this stalls the overall process and may cause cache miss.
+ 			
+ 			second it checks if the skb_count == threshold value(NAPI_SKB_CACHE_SIZE) if not it just increases the skb_count and another skb
+ 			called from the clist and the process repeats.
+			
+			if the threshold value is reached, it then calls the bulk free fucntion:
+						
+						kmem_cache_free_bulk(skbuff_head_cache, NAPI_SKB_CACHE_SIZE, nc->skb_cache);
+						
+						
+						
+ What is freelist? 
+ (After Reading content from the slide)
+  Each free object stores a pointer to the next free object, allowing fast allocation and deallocation.
+  
+  Why not clear the memory?
+  not needed as it will be reintialized when allocated again.
+  
+
