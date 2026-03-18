@@ -1,0 +1,308 @@
+============================================================
+CPDMA DESCRIPTOR hw_mode — COMPLETE DETAILED EXPLANATION
+============================================================
+
+
+============================================================
+1) hw_mode — EXACT MEANING AND BIT LAYOUT
+============================================================
+
+--- Definition
+    In CPDMA, hw_mode is the MAIN CONTROL WORD of a DMA descriptor.
+    It tells the DMA engine HOW to interpret this descriptor.
+
+--- Conceptual layout
+    31                     16 15            0
+    +----------------------+-----------------+
+    |     control bits     |     length      |
+    +----------------------+-----------------+
+
+    - Upper bits  : Control / flags
+    - Lower bits  : Buffer length (bytes)
+
+
+============================================================
+2) TYPICAL CPDMA hw_mode BITS (TX)
+============================================================
+
+--- Bit layout (TX path)
+
+    Bit   Name        Meaning
+    ----------------------------------------------
+    31    OWNER       1 = owned by DMA
+                      0 = owned by CPU
+
+    30    EOQ         End Of Queue (set by DMA)
+
+    29    SOP         Start Of Packet
+
+    28    EOP         End Of Packet
+
+    27    PASS_CRC    Hardware appends Ethernet CRC
+
+    26:24 PORT        Destination port (directed TX)
+
+    15:0  LENGTH      Number of bytes in this buffer
+
+
+============================================================
+3) HOW DRIVER BUILDS hw_mode
+============================================================
+
+--- Code example
+    mode = CPDMA_DESC_OWNER |
+           CPDMA_DESC_SOP   |
+           CPDMA_DESC_EOP;
+
+    writel_relaxed(mode | len, &desc->hw_mode);
+
+--- What this means
+    - Sets DMA ownership
+    - Marks this descriptor as both
+        * Start Of Packet
+        * End Of Packet
+    - Encodes buffer length in lower bits
+
+--- Result
+    This descriptor represents ONE COMPLETE PACKET.
+
+
+============================================================
+4) MEANING OF IMPORTANT hw_mode BITS
+============================================================
+
+------------------------------------------------------------
+4.1 OWNER (CPDMA_DESC_OWNER)
+------------------------------------------------------------
+
+--- Meaning
+    Ownership handoff mechanism between CPU and DMA
+
+--- Values
+    0 → CPU owns descriptor
+        - Safe for driver to modify
+
+    1 → DMA owns descriptor
+        - Hardware may read/write
+        - CPU MUST NOT touch descriptor
+
+--- Lifecycle
+    CPU sets OWNER → DMA processes → DMA clears OWNER
+
+
+------------------------------------------------------------
+4.2 SOP (Start Of Packet)
+------------------------------------------------------------
+
+--- Meaning
+    Indicates this descriptor contains
+    the FIRST byte of a packet.
+
+--- Used by DMA to
+    - Start a new frame assembly
+    - Reset internal packet state
+
+
+------------------------------------------------------------
+4.3 EOP (End Of Packet)
+------------------------------------------------------------
+
+--- Meaning
+    Indicates this descriptor contains
+    the LAST byte of a packet.
+
+--- Used by DMA to
+    - Transmit the assembled frame
+    - Generate TX completion
+
+
+------------------------------------------------------------
+4.4 PORT (Directed TX)
+------------------------------------------------------------
+
+--- Purpose
+    Tells CPSW which port to transmit on.
+
+--- Encoding
+    Inserted via:
+        cpdma_desc_to_port(chan, mode, si->directed);
+
+--- Examples
+    PORT = EMAC0
+    PORT = EMAC1
+    PORT = HOST
+
+--- Without PORT
+    CPSW would not know
+    where to send the packet.
+
+
+------------------------------------------------------------
+4.5 LENGTH
+------------------------------------------------------------
+
+--- Location
+    Lower 16 bits of hw_mode
+
+--- Meaning
+    Number of bytes DMA should read
+    from hw_buffer for this descriptor
+
+--- Encoding
+    hw_mode = mode | len
+
+
+============================================================
+5) WHY SOP / EOP EXIST (MULTI-DESCRIPTOR PACKETS)
+============================================================
+
+--- Core problem
+    Packets may NOT be contiguous in memory.
+
+--- skb layout example
+    skb->data       (64 bytes)
+    skb->frag[0]    (512 bytes)
+    skb->frag[1]    (300 bytes)
+
+--- Requirement
+    Hardware must support
+    scatter-gather DMA.
+
+
+============================================================
+6) SINGLE-DESCRIPTOR PACKET (SIMPLE CASE)
+============================================================
+
+--- Descriptor flags
+    SOP = 1
+    EOP = 1
+
+--- Meaning
+    "This descriptor contains the entire packet."
+
+--- Diagram
+    Descriptor #1
+    +-----------------------------+
+    | SOP | EOP | buffer | length |
+    +-----------------------------+
+
+--- DMA behavior
+    - Read buffer
+    - Transmit packet
+    - Done
+
+
+============================================================
+7) MULTI-DESCRIPTOR PACKET (SCATTER-GATHER)
+============================================================
+
+--- Descriptor chain layout
+
+    Descriptor 1:
+        SOP = 1
+        EOP = 0
+        (first fragment)
+
+    Descriptor 2:
+        SOP = 0
+        EOP = 0
+        (middle fragment)
+
+    Descriptor 3:
+        SOP = 0
+        EOP = 1
+        (last fragment)
+
+
+--- ASCII view
+    [ SOP ] ---> [ MID ] ---> [ EOP ]
+
+
+--- Each descriptor contains
+    - Its own hw_buffer
+    - Its own LENGTH
+    - hw_next pointer to next descriptor
+
+
+============================================================
+8) HOW CPDMA PROCESSES DESCRIPTOR CHAINS
+============================================================
+
+--- Processing logic
+    - Sees SOP      → start new packet
+    - Reads buffer1
+    - Reads buffer2
+    - Reads buffer3
+    - Sees EOP      → transmit packet
+
+--- From wire perspective
+    ONE Ethernet frame is transmitted.
+
+
+============================================================
+9) WHY SOP / EOP ARE MANDATORY
+============================================================
+
+--- Without SOP / EOP
+    Hardware would not know:
+        - Where packet starts
+        - Where packet ends
+
+--- Consequences
+    - Packets could be merged
+    - Packets could be split incorrectly
+    - Data corruption on the wire
+
+--- Therefore
+    SOP / EOP are REQUIRED flags.
+
+
+============================================================
+10) hw_next AND DESCRIPTOR LINKING
+============================================================
+
+--- Descriptor chaining
+    desc1->hw_next = desc2;
+    desc2->hw_next = desc3;
+    desc3->hw_next = 0;
+
+--- DMA behavior
+    - Follows hw_next pointers
+    - Stops when:
+        * hw_next == 0
+        * AND EOP was seen
+
+
+============================================================
+11) TX COMPLETION HANDLING
+============================================================
+
+--- After DMA finishes transmitting
+    - DMA clears OWNER bit
+    - DMA sets EOQ if needed
+    - Interrupt is raised
+
+--- Driver TX completion
+    - Walks completed descriptors
+    - Uses sw_token to identify skb
+    - Frees skb ONLY after EOP descriptor
+
+--- Important rule
+    Packet is considered complete
+    ONLY when the EOP descriptor completes.
+
+
+============================================================
+12) FINAL SUMMARY
+============================================================
+
+- hw_mode is the primary DMA control word
+- OWNER controls CPU ↔ DMA ownership
+- SOP / EOP define packet boundaries
+- LENGTH defines bytes per descriptor
+- hw_next enables scatter-gather DMA
+- Multi-descriptor packets are normal
+- Only EOP completes a packet
+- Correct hw_mode flags are CRITICAL
+  for correct packet transmission
+
