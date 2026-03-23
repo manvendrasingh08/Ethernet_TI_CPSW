@@ -4,10 +4,10 @@ irqreturn_t cpsw_tx_interrupt(int irq, void *dev_id)
 	struct cpsw_common *cpsw = dev_id;
 
 	writel(0, &cpsw->wr_regs->tx_en);   // disable the tx interrupts by putting 0 in tx_en register.  🛑️Complete flow in "4)" file.
-	cpdma_ctlr_eoi(cpsw->dma, CPDMA_EOI_TX);  // it provides the eacknowledgement that the interrupt ha sbeen recieved to teh source.
+	cpdma_ctlr_eoi(cpsw->dma, CPDMA_EOI_TX);  // it provides the eacknowledgement that the interrupt has been recieved to the source.
 
 	if (cpsw->quirk_irq) {
-		disable_irq_nosync(cpsw->irqs_table[1]);
+		disable_irq_nosync(cpsw->irqs_table[1]);  //“Do not invoke the ISR for this IRQ anymore”
 		cpsw->tx_irq_disabled = true;
 	}
 	
@@ -199,6 +199,7 @@ static __latent_entropy void net_rx_action(struct softirq_action *h)
 	
 
 out:
+
 	__kfree_skb_flush();
 }
 
@@ -306,7 +307,8 @@ int cpsw_tx_poll(struct napi_struct *napi_tx, int budget)
 	 napi_to_cpsw(napi_tx) → converts the napi_struct pointer to the CPSW driver’s private structure.
 
 		Why:
-		struct cpsw_commoncontains all state for the CPSW device:
+		struct cpsw_common 
+		contains all state for the CPSW device:
 
 				TX channels
 				IRQ info
@@ -368,7 +370,7 @@ static int __cpdma_chan_process(struct cpdma_chan *chan)
 	unsigned long			flags;
 
 	spin_lock_irqsave(&chan->lock, flags);
-
+	
 	desc = chan->head;
 	if (!desc) {
 		chan->stats.empty_dequeue++;
@@ -392,7 +394,15 @@ static int __cpdma_chan_process(struct cpdma_chan *chan)
 			    CPDMA_DESC_PORT_MASK | CPDMA_RX_VLAN_ENCAP);
 
 	chan->head = desc_from_phys(pool, desc_read(desc, hw_next));
-	chan_write(chan, cp, desc_dma);     // DMA completeion pointer (cp) register is written so that hardware knows software has processed it
+	chan_write(chan, cp, desc_dma);     /* DMA completeion pointer (cp) register is written so that hardware knows software has processed it
+										The CP register is a per-channel hardware register used by the CPDMA engine.
+										What does hardware do when CP is written?
+											Hardware now knows: “Descriptors up to this address are no longer in use by software.
+											  So it can: Mark those descriptors as free, Reuse them for future DMA, ”
+											  
+											  CP is a boundary marker, not a queue. 
+											  
+											  */	
 	chan->count--;							
 	chan->stats.good_dequeue++;
 
@@ -426,13 +436,13 @@ This function is responsible for processing completed TX DMA descriptors up to t
 
 There is a while loop that runs as long as **used < quota**. Inside this loop, __cpdma_chan_process() is called, which processes exactly one DMA descriptor per call.
 
-Inside __cpdma_chan_process(), the function first looks at the descriptor pointed to by chan->head, which is the current descriptor expected to be completed next. It reads the descriptor’s hardware OWNER bit from the mode field. If the OWNER bit is set, it means the hardware DMA engine still owns the descriptor and is actively transmitting, so it is not safe for the CPU to touch it. In this case, processing stops and control returns to the caller.
+Inside __cpdma_chan_process(), everytime it processes the descriptor that is head of the channel, pointed to by chan->head, which is the current descriptor expected to be completed next. It reads the descriptor’s hardware OWNER bit from the mode field. If the OWNER bit is set, it means the hardware DMA engine still owns the descriptor and is actively transmitting, so it is not safe for the CPU to touch it. In this case, processing stops and control returns to the caller.
 
-If the OWNER bit is not set, it means the hardware has completed the DMA operation and it is now safe for the CPU to reclaim the descriptor. The function then extracts the transmitted packet length, adjusts it if the CRC was included, and advances the DMA ring by moving chan->head to the next descrhw_next field. It also updates the DMA completion pointer (CP) register to inform the hardware that this descriptor has been fully processed by software.
+If the OWNER bit is not set, it means the hardware has completed the DMA operation and it is now safe for the CPU to reclaim the descriptor. The function then extracts the transmitted packet length, adjusts it if the CRC was included, and advances the DMA ring by moving chan->head to the next desc hw_next field. It also updates the DMA completion pointer (CP) register to inform the hardware that this descriptor has been fully processed by software.
 
 At this point, the descriptor is considered successfully completed, so the internal descriptor count is decremented and DMA statistics are updated.
 
-If the descriptor has the EOQ (End Of Queue) bit set and there is still another descriptor present in the chain, it means the DMA engine stopped because it reached the end of the programmed queue even though more descriptors were alreadHDP (Head Descriptor Pointer) register to re-prime the DMA engine and continue transmission, preventing a TX stall.
+If the descriptor has the EOQ (End Of Queue) bit set and there is still another descriptor present in the chain, it means the DMA engine stopped because it reached the end of the programmed queue even though more descriptors were already added into the channel so it again writes HDP (Head Descriptor Pointer) register to restart the DMA engine and continue transmission, preventing a TX stall.
 
 After releasing the channel lock, the function determines the appropriate callback status and then calls __cpdma_chan_free()
 */
@@ -544,6 +554,17 @@ void cpsw_tx_handler(void *token, int len, int status)
 in dev.c
 =========
 
+enum skb_free_reason {
+			SKB_REASON_CONSUMED,
+			SKB_REASON_DROPPED,
+		};
+
+static inline void dev_kfree_skb_any(struct sk_buff *skb)
+{
+	__dev_kfree_skb_any(skb, SKB_REASON_DROPPED);
+}
+
+/*in here why SKB_REASON_DROPPED, because dev_kfree_skb_any is a helper function and does not know what */
 
 void __dev_kfree_skb_any(struct sk_buff *skb, enum skb_free_reason reason)
 {		
@@ -555,19 +576,25 @@ void __dev_kfree_skb_any(struct sk_buff *skb, enum skb_free_reason reason)
 EXPORT_SYMBOL(__dev_kfree_skb_any);
 
 
-/* An SKB can be freed from many contexts:
+/* A SKB can be freed from many contexts:
 
 		Hard IRQ (TX interrupt)
 		Softirq (NET_TX_SOFTIRQ)
 		Process context (system call, kthread)
 		
-		💥 Freeing an SKB incorrectly in the wrong context can crash the kernel. so linux provides this : 
+		💥 Freeing an SKB incorrectly in the wrong context can crash the kernel. so linux provides this 
 		
 		
 		it checks if the irq are enabled or disabled if any og the thing is true then it cannot free the skb immediately as kfree may sleep
 		or acquire lock and in softirq no sleeping should be there so it calls __dev_kfree_skb_irq. 
 		
 		and if called form the process context it just frees the skb immdiately using dev_kfree_skb.
+		
+		
+		enum skb_free_reason {
+			SKB_REASON_CONSUMED,
+			SKB_REASON_DROPPED,
+		};
 		
 		
 		*/
@@ -585,17 +612,17 @@ void __dev_kfree_skb_irq(struct sk_buff *skb, enum skb_free_reason reason)
 	if (unlikely(!skb))
 		return;
 
-	if (likely(refcount_read(&skb->users) == 1)) {
-		smp_rmb();
+	if (likely(refcount_read(&skb->users) == 1)) {    // if ref = 1, this means the current context holds the last reference to the SKB.
+		smp_rmb();			//is executed to ensure that all prior reads of SKB data complete before the reference count is set to zero.
 		refcount_set(&skb->users, 0);
-	} else if (likely(!refcount_dec_and_test(&skb->users))) {
-		return;
+	} else if (likely(!refcount_dec_and_test(&skb->users))) {  //if more than 1 the function just simply decrements the ref count.
+		return;						
 	}
-	get_kfree_skb_cb(skb)->reason = reason;
-	local_irq_save(flags);
-	skb->next = __this_cpu_read(softnet_data.completion_queue);
-	__this_cpu_write(softnet_data.completion_queue, skb);
-	raise_softirq_irqoff(NET_TX_SOFTIRQ);
+	get_kfree_skb_cb(skb)->reason = reason;  //enters the reason on control buffer which will be later be used for tracing and debugging
+	local_irq_save(flags);     // stops all interrupts on the current cpu & save the previous interrupt state into flags
+	skb->next = __this_cpu_read(softnet_data.completion_queue);  //completion queue is a singly linked list and its head is made skb->next
+	__this_cpu_write(softnet_data.completion_queue, skb);		//write skb as the head of the queue.
+	raise_softirq_irqoff(NET_TX_SOFTIRQ);   // raises the softirq to defer the work of freeing the skb
 	local_irq_restore(flags);
 }
 
@@ -611,7 +638,7 @@ dev_kfree_skb_any() selects this function when it detects that the caller is run
 Inside __dev_kfree_skb_irq(), the function first checks whether the skb pointer is valid. It then examines the reference count (skb->users):
 
 	>If the reference count is exactly 1, this means the current context holds the last reference to the SKB.
-	 A read memory barriersmp_rmb()) is executed to ensure that all prior reads of SKB data complete before the reference count is set to
+	 A read memory barrier smp_rmb()) is executed to ensure that all prior reads of SKB data complete before the reference count is set to
 	 zero. This prevents memory reordering issues on SMP systems.
  	 The reference count is then set to 0, marking the SKB as logically dead.
 
@@ -625,11 +652,18 @@ This is done by using skb->next to link the SKB into a singly linked list of SKB
 
 skb->next is set to the current head of the completion queue
 
-the completi
+the completion queue head is then set to the current skb.
+
+
 
 Finally, NET_TX_SOFTIRQ is raised. This schedules net_tx_action() to run later in softirq context, where the SKBs in the completion queue are actually freed safely.
 
+🛑️Also it does this as it does not assume that it is alsready isnside a softirq context as __dev_kfree_skb_irq() can be called by hard irq context
+softirq context(which is in thi case)/ It does not performs checks of if it is present in softirq context coz that cause check cyles.
+
 This deferred-free mechanism ensures that SKBs are not freed directly in interrupt context, avoids locking and memory allocation in IRQ handlers, and provides safe and efficient cleanup on SMP systems
+
+local_irq_restore(flags)  does:  
 
  */
 
@@ -656,11 +690,12 @@ static __latent_entropy void net_tx_action(struct softirq_action *h)
 
 			clist = clist->next;
 
-			WARN_ON(refcount_read(&skb->users));
-			if (likely(get_kfree_skb_cb(skb)->reason == SKB_REASON_CONSUMED))
+			WARN_ON(refcount_read(&skb->users));  
+			if (likely(get_kfree_skb_cb(skb)->reason == SKB_REASON_CONSUMED))	 // this is done for backward compatibilty.
 				trace_consume_skb(skb);
 			else
-				trace_kfree_skb(skb, net_tx_action);
+				trace_kfree_skb(skb, net_tx_action);  //Emits a tracepoint indicating that an SKB was successfully it records : SKB pointer,
+													 // Freeing function name, Reason (dropped), Device info
 
 			if (skb->fclone != SKB_FCLONE_UNAVAILABLE)
 				__kfree_skb(skb);
@@ -809,6 +844,55 @@ static void skb_release_data(struct sk_buff *skb)
 
 	skb_zcopy_clear(skb, true);
 	skb_free_head(skb);
+	
 }
+
+
+/*    
+
+Explanation after ethernet frame is sent :
+
+The DMA engine uses the start-of-packet and end-of-packet information provided in the TX descriptor to read exactly the specified number of bytes from system memory and stream those bytes into the MAC’s transmit FIFO. The DMA engine itself only transfers raw frame data and does not operate at the bit level or handle Ethernet framing details. Once data is available in the MAC FIFO, the MAC hardware takes over and transmits the frame on the wire by first sending a 7-byte Ethernet preamble, which provides a regular transition pattern used by the receiver PHY to recover and synchronize its clock. This is followed by a 1-byte Start Frame Delimiter (SFD) with the pattern 10101011, where the final two consecutive ones indicate the precise boundary between the preamble and the Ethernet frame. After the SFD, the MAC transmits the actual Ethernet frame bytes from the FIFO, appends the CRC, and completes the transmission. On the receive side, detection of the SFD tells the MAC that the next byte corresponds to the start of the Ethernet frame header.
+
+Ohy is used to convert these bytes into elctrical signals and send to the wire.
+
+
+
+Preamble :  
+
+The DMA engine uses the start-of-packet and end-of-packet information provided in the TX descriptor to read exactly the specified number of bytes from system memory and stream those bytes into the MAC’s transmit FIFO. The DMA engine itself only transfers raw frame data and does not operate at the bit level or handle Ethernet framing details. Once data is available in the MAC FIFO, the MAC hardware takes over and transmits the frame on the wire by first sending a 7-byte Ethernet preamble, which provides a regular transition pattern used by the receiver PHY to recover and synchronize its clock. This is followed by a 1-byte Start Frame Delimiter (SFD) with the pattern 10101011, where the final two consecutive ones indicate the precise boundary between the preamble and the Ethernet frame. After the SFD, the MAC transmits the actual Ethernet frame bytes from the FIFO, appends the CRC, and completes the transmission. On the receive side, detection of the SFD tells the MAC that the next byte corresponds to the start of the Ethernet frame header.
+
+
+👉 Yes — the preamble is still sent on modern Ethernet.
+👉 It has never gone away.
+👉 What changed over time is how it is encoded and handled, not whether it exists.
+
+		1. Is preamble still sent today?
+
+		✔ Yes, for all IEEE Ethernet standards:
+
+		10 Mbps (10BASE-T)
+		100 Mbps (Fast Ethernet)
+		1 Gbps (Gigabit Ethernet)
+		10G / 25G / 40G / 100G Ethernet
+		Every Ethernet frame still begins with:
+		Preamble + SFD
+
+		This is mandatory per IEEE 802.3.
+
+		2. Why it can feel like “old Ethernet behavior”
+
+		You don’t see the preamble anymore because:
+
+		NICs hide it completely
+		Packet captures don’t show it
+		Software never touches it
+		Modern PHYs lock very fast
+
+		So it feels invisible — but it’s there.
+
+*/
+
+
 
 

@@ -1,0 +1,43 @@
+HW TX Engine Active
+┌─────────────────────────────┐
+│ Descriptors are transmitted │
+│ Hardware generates TX IRQs │
+└─────────────┬───────────────┘
+              │
+              ▼
+       CPSW TX Interrupt Handler
+       (cpsw_tx_interrupt)
+       ┌─────────────────────────────┐
+       │ 1️⃣ Disable tx_en (writel 0) │
+       │    - Stop TX DMA engine      │
+       │    - Prevent new TX IRQs     │
+       │ 2️⃣ Send EOI to hardware     │
+       │ 3️⃣ Possibly disable Linux   │
+       │    IRQ line (quirk)         │
+       │ 4️⃣ Schedule NAPI (napi_tx) │
+       └─────────────────────────────┘
+              │
+              ▼
+       Softirq: NAPI Polling
+       (cpsw_tx_poll called via napi_poll)
+       ┌─────────────────────────────┐
+       │ 1️⃣ Process up to `budget`   │
+       │    completed TX descriptors │
+       │ 2️⃣ Call cpsw_tx_handler     │
+       │    - Free SKBs / XDP frames │
+       │    - Update TX stats        │
+       │    - Wake TX queue if needed│
+       │ 3️⃣ If all descriptors done  │
+       │    - napi_complete          │
+       │    - Re-enable tx_en (0xff) │
+       │    - Re-enable Linux IRQ    │
+       └─────────────────────────────┘
+              │
+              ▼
+       TX Engine Resumes
+       ┌─────────────────────────────┐
+       │ HW TX engine ready to send  │
+       │ next descriptors             │
+       │ IRQs can fire again          │
+       └─────────────────────────────┘
+

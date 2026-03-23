@@ -1,0 +1,21 @@
+Why TX polling is combined with RX polling
+
+Key insight:
+
+RX and TX both require reading NIC state
+Both involve DMA rings
+Both benefit from batching
+
+So Linux combines them:
+
+One polling loop (NAPI)
+
+One softirq (NET_RX_SOFTIRQ)
+
+Both RX + TX handled together
+
+This prevents:
+
+RX starvation due to TX floods
+
+TX starvation due to RX floods
